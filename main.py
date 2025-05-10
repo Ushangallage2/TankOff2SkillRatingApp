@@ -1,4 +1,7 @@
 import shutil
+from threading import Thread
+
+import requests
 from kivy.core.window import Window
 import bcrypt
 import mysql.connector  # MySQL Driver
@@ -227,6 +230,29 @@ def get_special_folder(name):
         "Pictures": home / "Pictures"
     }
     return str(folders.get(name, home))
+
+
+def check_for_updates(current_version="3.0.0"):
+    url = "https://itch.io/api/1/x/wharf/latest"
+    params = {
+        "target": "fury-to2/to2skillratingapp",
+        "channel_name": "windows"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.ok:
+            data = response.json()
+            latest_version = data.get("latest")
+            if latest_version and latest_version != current_version:
+                def show_popup(*args):
+                    Popup(title="Update Available",
+                          content=Label(text=f"New version {latest_version} is available!"),
+                          size_hint=(0.6, 0.4)).open()
+                Clock.schedule_once(show_popup)
+        # else: print("You have the latest version.")
+    except Exception as e:
+        print(f"Update check failed: {e}")
+
 
 
 class ImageButton(ButtonBehavior, Image):
@@ -1112,6 +1138,9 @@ class SkillRatingApp(MDApp):
         popup.open()
 
     def on_start(self):
+
+        Thread(target=check_for_updates).start()
+
         try:
             self.retry_check_app_version()
         except Exception as e:
@@ -1120,12 +1149,12 @@ class SkillRatingApp(MDApp):
 
     def retry_check_app_version(self):
         try:
-            self.check_app_version(APP_VERSION="2.0.0")
+            self.check_app_version(APP_VERSION="3.0.0")
         except Exception as e:
             print(f"Retry version check failed: {e}")
             self.show_no_connection_popup()
 
-    def check_app_version(self, APP_VERSION="2.0.0"):
+    def check_app_version(self, APP_VERSION="3.0.0"):
         try:
             if getattr(sys, 'frozen', False):
                 dotenv_path = os.path.join(sys._MEIPASS, '.env')
@@ -1261,7 +1290,7 @@ class SkillRatingApp(MDApp):
     def try_again_connection(self, *args):
         print("[INFO] Retrying database connection...")
         try:
-            self.check_app_version(APP_VERSION="2.0.0")
+            self.check_app_version(APP_VERSION="3.0.0")
             if self.conn:
                 print("[INFO] Reconnection successful.")
                 self.popup.dismiss()
@@ -1575,7 +1604,7 @@ class SkillRatingApp(MDApp):
         self.root.remove_widget(self.splash)
 
         try:
-            self.check_app_version(APP_VERSION="2.0.0")
+            self.check_app_version(APP_VERSION="3.0.0")
         except Exception as e:
             print(f"Startup error: {e}")
             Clock.schedule_once(lambda dt: self.show_no_connection_popup(), 0)
