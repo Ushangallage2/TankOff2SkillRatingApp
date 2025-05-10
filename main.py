@@ -1,11 +1,14 @@
-import os
 import shutil
+
+import bcrypt
 import mysql.connector  # MySQL Driver
 from dotenv import load_dotenv
 from kivy.app import App
 import psutil
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.dropdown import DropDown
+from kivy.uix.filechooser import FileChooserIconView
 from kivy.uix.floatlayout import FloatLayout
 from fpdf import FPDF
 from kivy.uix.popup import Popup
@@ -15,7 +18,7 @@ from kivy.uix.widget import Widget
 from kivymd.app import MDApp
 from kivy.animation import Animation  # Import Animation
 from kivy.uix.image import Image
-from kivy.graphics import Ellipse
+from kivy.graphics import Ellipse, RoundedRectangle
 import random
 import pygame
 import sys
@@ -41,7 +44,94 @@ from kivy.core.window import Window
 from kivy.properties import BooleanProperty
 from kivy.uix.label import Label
 from kivy.properties import NumericProperty
+import json
 from tkinter import Tk, filedialog
+from pathlib import Path
+import os, json, http.client, mimetypes, re
+from pathlib import Path
+import win32timezone
+Window.set_icon('icon.ico')
+
+load_dotenv()
+RAPIDAPI_KEYS = os.getenv('RAPIDAPI_KEYS', '').split(',')
+RAPIDAPI_HOST = os.getenv('RAPIDAPI_HOST', 'ocr43.p.rapidapi.com')
+
+def ocr_api_request(file_path):
+    with open(file_path, "rb") as f:
+        image_data = f.read()
+    boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+    payload = (
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="image"; filename="{os.path.basename(file_path)}"\r\n'
+        f'Content-Type: {mimetypes.guess_type(file_path)[0] or "application/octet-stream"}\r\n\r\n'
+    ).encode('utf-8') + image_data + f'\r\n--{boundary}--\r\n'.encode('utf-8')
+    for key in RAPIDAPI_KEYS:
+        headers = {
+            'x-rapidapi-key': key,
+            'x-rapidapi-host': RAPIDAPI_HOST,
+            'Content-Type': f"multipart/form-data; boundary={boundary}"
+        }
+        conn = http.client.HTTPSConnection(RAPIDAPI_HOST)
+        conn.request("POST", "/v1/results", body=payload, headers=headers)
+        res = conn.getresponse()
+        data = res.read()
+        conn.close()
+        try:
+            result = json.loads(data.decode("utf-8"))
+            if result.get("results", [{}])[0].get("status", {}).get("code", "") == "ok":
+                return result
+            else:
+                continue
+        except Exception:
+            continue
+    raise Exception("All API keys failed or limit reached.")
+
+
+
+import re
+
+import re
+
+def parse_leaderboard_text(ocr_text):
+    # Remove header if present
+    ocr_text = re.sub(r'^Flags Kills XP Total Level', '', ocr_text).strip()
+    # Match: number., name, flags, kills, xp, total, level
+    pattern = re.compile(
+        r'(\d+)\.\s*'                  # player number
+        r'([^\d]+?)\s+'                # player name
+        r'(\d+)\s+'                    # flags
+        r'(\d+)\s+'                    # kills
+        r'([\d,]+k?)\s+'               # xp
+        r'([\d,]+k?)\s+'               # total
+        r'(\d+)'                       # level
+    )
+    matches = list(pattern.finditer(ocr_text))
+    num_players = len(matches)
+    players = {}
+
+    for idx, m in enumerate(matches):
+        player_number = m.group(1)
+        name = m.group(2).strip()
+        flags = m.group(3)
+        kills = m.group(4)
+        xp = m.group(5).replace(",", "")  # Remove commas
+        # total = m.group(6)  # not used
+        level = m.group(7)
+        team = "Red" if idx < num_players // 2 else "Blue"
+        players[f"{team} Player {player_number}"] = {
+            "team": team,
+            "name": name,
+            "static_inputs": [
+                kills,      # Kills
+                flags,      # Flags
+                level,      # Level
+                "8",        # Minutes (always 8)
+                "00",       # Seconds (always 00)
+                xp          # XP, no commas
+            ],
+            "dynamic_segments": [{}]
+        }
+    return players
 
 
 
@@ -60,7 +150,7 @@ def resource_path(relative_path):
     return full_path
 
 
-img_path = resource_find(resource_path('positions/tank.png'))
+#img_path = resource_find(resource_path('positions/tank.png'))
 
 
 medal_files = [
@@ -96,25 +186,267 @@ except ValueError:
     port = 16308
 
 
+def get_special_folder(name):
+    home = Path.home()
+    if sys.platform.startswith('win'):
+        folders = {
+            "Desktop": home / "Desktop",
+            "Documents": home / "Documents",
+            "Downloads": home / "Downloads",
+            "Pictures": home / "Pictures"
+        }
+    else:
+        folders = {
+            "Desktop": home / "Desktop",
+            "Documents": home / "Documents",
+            "Downloads": home / "Downloads",
+            "Pictures": home / "Pictures"
+        }
+    return str(folders.get(name, home))
+
+
+def get_documents_folder():
+    if sys.platform.startswith('win'):
+        from pathlib import Path
+        return str(Path.home() / "Documents")
+    elif sys.platform.startswith('darwin'):
+        return os.path.expanduser("~/Documents")
+    else:  # Linux and others
+        return os.path.expanduser("~/Documents")
+
+
+
+def get_special_folder(name):
+    home = Path.home()
+    folders = {
+        "Home": home,
+        "Desktop": home / "Desktop",
+        "Documents": home / "Documents",
+        "Downloads": home / "Downloads",
+        "Pictures": home / "Pictures"
+    }
+    return str(folders.get(name, home))
+
+
+class ImageButton(ButtonBehavior, Image):
+    pass
+
+
+class FileChooserPopup(Popup):
+    def __init__(self, title, on_selection, select_type="open", **kwargs):
+        super().__init__(**kwargs)
+        self.title = title
+        self.size_hint = (0.95, 0.95)
+        self.auto_dismiss = False
+
+        # --- Glass Effect Background ---
+        with self.canvas.before:
+            Color(0.15, 0.18, 0.25, 0.78)  # RGBA: semi-transparent, bluish glass
+            self.bg_rect = RoundedRectangle(radius=[18], pos=self.pos, size=self.size)
+            # Optional: white border for more glassy look
+            Color(1, 1, 1, 0.18)
+            self.border_rect = RoundedRectangle(radius=[18], pos=self.pos, size=self.size)
+
+        self.bind(pos=self._update_bg, size=self._update_bg)
+
+        layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        # Shortcut bar
+        shortcut_bar = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=5)
+        for folder in ["Home", "Desktop", "Documents", "Downloads", "Pictures"]:
+            btn = Button(text=folder, size_hint_x=None, width=120, background_normal='', background_color=(0.2,0.2,0.3,0.5))
+            btn.bind(on_release=lambda btn, f=folder: self.set_path(f))
+            shortcut_bar.add_widget(btn)
+        layout.add_widget(shortcut_bar)
+
+        # FileChooser
+        self.filechooser = FileChooserIconView(
+            filters=['*.json'],
+            path=get_special_folder("Documents")
+        )
+        layout.add_widget(self.filechooser)
+
+        # Select/Cancel bar
+        btn_layout = BoxLayout(size_hint_y=None, height=50, spacing=10)
+        select_btn = Button(text="Select", background_normal='', background_color=(0.1,0.5,1,0.7))
+        cancel_btn = Button(text="Cancel", background_normal='', background_color=(1,0.1,0.1,0.7))
+        btn_layout.add_widget(select_btn)
+        btn_layout.add_widget(cancel_btn)
+        layout.add_widget(btn_layout)
+        self.add_widget(layout)
+
+        def do_select(instance):
+            selection = self.filechooser.selection
+            if selection:
+                self.dismiss()
+                on_selection(selection[0])
+        select_btn.bind(on_release=do_select)
+        cancel_btn.bind(on_release=lambda x: self.dismiss())
+
+    def _update_bg(self, *args):
+        self.bg_rect.pos = self.pos
+        self.bg_rect.size = self.size
+        self.border_rect.pos = self.pos
+        self.border_rect.size = self.size
+
+    def set_path(self, folder_name):
+        self.filechooser.path = get_special_folder(folder_name if folder_name != "Home" else "")
+
+
+class FileSavePopup(Popup):
+    def __init__(self, title, on_save, filetypes=None, default_name="untitled", **kwargs):
+        super().__init__(**kwargs)
+        self.title = title
+        self.size_hint = (0.95, 0.95)
+        self.auto_dismiss = False
+        self.on_save = on_save
+        self.filetypes = filetypes or [("JSON Files", "*.json"), ("Text Files", "*.txt"), ("CSV Files", "*.csv"), ("All Files", "*.*")]
+        self.selected_ext = self.filetypes[0][1][1:]  # e.g. '.json'
+
+        layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        # Shortcut bar
+        shortcut_bar = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=5)
+        for folder in ["Home", "Desktop", "Documents", "Downloads", "Pictures"]:
+            btn = Button(text=folder, size_hint_x=None, width=120)
+            btn.bind(on_release=lambda btn, f=folder: self.set_path(f))
+            shortcut_bar.add_widget(btn)
+        layout.add_widget(shortcut_bar)
+
+        # FileChooser
+        self.filechooser = FileChooserIconView(
+            filters=[ft[1] for ft in self.filetypes],
+            path=get_special_folder("Documents")
+        )
+        layout.add_widget(self.filechooser)
+
+        # Filename and filetype
+        file_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
+        file_row.add_widget(Label(text="File name:", size_hint_x=0.3))
+        self.filename_input = TextInput(text=default_name, multiline=False, size_hint_x=0.4)
+        file_row.add_widget(self.filename_input)
+        self.filetype_spinner = Spinner(
+            text=self.filetypes[0][0],
+            values=[ft[0] for ft in self.filetypes],
+            size_hint_x=0.3
+        )
+        file_row.add_widget(self.filetype_spinner)
+        layout.add_widget(file_row)
+
+        # Buttons
+        btn_layout = BoxLayout(size_hint_y=None, height=50, spacing=10)
+        save_btn = Button(text="Save")
+        cancel_btn = Button(text="Cancel")
+        btn_layout.add_widget(save_btn)
+        btn_layout.add_widget(cancel_btn)
+        layout.add_widget(btn_layout)
+        self.add_widget(layout)
+
+        self.filetype_spinner.bind(text=self.on_filetype_change)
+        save_btn.bind(on_release=self.do_save)
+        cancel_btn.bind(on_release=lambda x: self.dismiss())
+
+    def set_path(self, folder_name):
+        self.filechooser.path = get_special_folder(folder_name if folder_name != "Home" else "")
+
+    def on_filetype_change(self, spinner, text):
+        # Update extension filter
+        for ft in self.filetypes:
+            if ft[0] == text:
+                self.selected_ext = ft[1][1:]  # e.g. '.json'
+                break
+
+    def do_save(self, instance):
+        directory = self.filechooser.path
+        filename = self.filename_input.text
+        if not filename:
+            return
+        # Ensure the filename has the correct extension
+        if not filename.endswith(self.selected_ext):
+            filename += self.selected_ext
+        file_path = os.path.join(directory, filename)
+        self.dismiss()
+        self.on_save(file_path)
+
+
+class FurySplashScreen(FloatLayout):
+    def __init__(self, on_finish_callback, **kwargs):
+        super().__init__(**kwargs)
+        # Draw a black background
+        with self.canvas:
+            Color(0, 0, 0, 1)
+            self.bg_rect = Rectangle(size=self.size, pos=self.pos)
+        self.bind(size=self._update_bg, pos=self._update_bg)
+
+        # Add the label
+        self.label = Label(
+            text="FURY PRODUCTION",
+            font_size='48sp',
+            bold=True,
+            color=(1, 1, 1, 0),  # Start fully transparent
+            size_hint=(None, None),
+            size=(self.width, self.height),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+        )
+        self.add_widget(self.label)
+
+        self.on_finish_callback = on_finish_callback
+
+        # Start animation after a small delay to ensure rendering
+        Clock.schedule_once(self.start_animation, 0.1)
+
+    def _update_bg(self, *args):
+        self.bg_rect.size = self.size
+        self.bg_rect.pos = self.pos
+
+    def start_animation(self, *args):
+        # Fade in
+        anim_in = Animation(color=(1, 1, 1, 1), duration=1.0)
+        # Hold
+        anim_hold = Animation(duration=1.2)
+        # Fade out
+        anim_out = Animation(color=(1, 1, 1, 0), duration=1.0)
+
+        # Chain animations
+        anim = anim_in + anim_hold + anim_out
+        anim.bind(on_complete=lambda *x: self.finish())
+        anim.start(self.label)
+
+    def finish(self):
+        if self.on_finish_callback:
+            self.on_finish_callback()
+
+
+
 
 class ConfirmationPopup(Popup):
     def __init__(self, title, message, on_confirm, on_cancel, **kwargs):
         super().__init__(**kwargs)
         self.title = title
-        self.size_hint = (0.7, 0.4)  # You can adjust size
+        self.size_hint = (0.7, 0.5)  # Slightly taller for scroll area
         self.auto_dismiss = False
 
         layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
 
-        layout.add_widget(Label(text=message))
+        # Scrollable Label for long messages
+        scroll_view = ScrollView(size_hint=(1, 1))
+        message_label = Label(
+            text=message,
+            text_size=(self.width * 0.9, None),  # Wrap horizontally
+            size_hint_y=None,
+            halign='left',
+            valign='top'
+        )
+        message_label.bind(texture_size=message_label.setter('size'))
+        scroll_view.add_widget(message_label)
+        layout.add_widget(scroll_view)
 
-        button_layout = BoxLayout(size_hint_y=0.3, spacing=10)
+        # Buttons
+        button_layout = BoxLayout(size_hint_y=None, height=40, spacing=10)
         yes_button = Button(text="Yes", on_release=lambda *args: self._confirm(on_confirm))
         no_button = Button(text="No", on_release=lambda *args: self._cancel(on_cancel))
-
         button_layout.add_widget(yes_button)
         button_layout.add_widget(no_button)
-
         layout.add_widget(button_layout)
 
         self.add_widget(layout)
@@ -189,7 +521,9 @@ class CountdownWidget(BoxLayout):
     countdown_text = StringProperty()
     progress = NumericProperty(0)
 
-    def __init__(self, target_datetime, target_timezone,conn, **kwargs):
+    DUMMY_NO_MAYHEM = "1900-07-01 00:00:00"
+
+    def __init__(self, target_datetime, target_timezone, conn, **kwargs):
         super().__init__(orientation='vertical', **kwargs)
         self.progress_circle = None
         self.glow_event = None
@@ -197,25 +531,38 @@ class CountdownWidget(BoxLayout):
         self.target_timezone = pytz.timezone(target_timezone)
         self.conn = conn
 
-        self.target_datetime = datetime.strptime(target_datetime, "%Y-%m-%d %H:%M:%S")
-        self.target_datetime = self.target_timezone.localize(self.target_datetime)
-        self.total_seconds = int((self.target_datetime - datetime.now(self.target_timezone)).total_seconds())
+        # --- Robustly handle initial target_datetime ---
+        if not target_datetime or target_datetime == self.DUMMY_NO_MAYHEM:
+            self.target_datetime = None
+        elif isinstance(target_datetime, datetime):
+            self.target_datetime = target_datetime
+        else:
+            self.target_datetime = self.target_timezone.localize(
+                datetime.strptime(target_datetime, "%Y-%m-%d %H:%M:%S")
+            )
 
-        self.label = Label(font_size=40, bold=True, color=(1, 1, 1, 1))  # Start with white color
+        self.total_seconds = (
+            int((self.target_datetime - datetime.now(self.target_timezone)).total_seconds())
+            if self.target_datetime else 0
+        )
+
+        self.label = Label(font_size=40, bold=True, color=(1, 1, 1, 1))
         self.add_widget(self.label)
 
         with self.canvas.after:
             Color(0.2, 0.6, 0.9, 1)
             self.progress_circle = Line(circle=(self.center_x, self.center_y, 100, 0, 0), width=4)
 
-        Clock.schedule_interval(self.update_countdown, 1)
-        Clock.schedule_interval(self.check_for_update, 10)  # Schedule checking AFTER everything is set up
+        # Only schedule countdown if there is a valid target
+        if self.target_datetime:
+            Clock.schedule_interval(self.update_countdown, 1)
+        Clock.schedule_interval(self.check_for_update, 10)
 
     def update_countdown(self, dt):
-        # Check if a countdown target is set
-        if not self.target_datetime or self.target_datetime <= datetime.now(self.target_timezone):
+        if not self.target_datetime:
             self.label.text = "NO MAYHEM SCHEDULED"
-            return  # Stop further processing
+            self.label.color = (1, 0, 0, 1)
+            return False  # Stop the timer
 
         now = datetime.now(self.target_timezone)
         remaining = self.target_datetime - now
@@ -223,7 +570,6 @@ class CountdownWidget(BoxLayout):
 
         if seconds < 0:
             self.label.text = "MAYHEM STARTED!"
-
             if not self.glow_event:
                 self.glow_event = Clock.schedule_interval(self.animate_glow, 0.5)
             return False  # Stop the countdown clock
@@ -236,11 +582,21 @@ class CountdownWidget(BoxLayout):
 
         # Animate progress circle
         self.total_seconds = int((self.target_datetime - datetime.now(self.target_timezone)).total_seconds())
-        percent = (self.total_seconds - int(
-            remaining.total_seconds())) / self.total_seconds if self.total_seconds > 0 else 0
+        percent = (self.total_seconds - int(remaining.total_seconds())) / self.total_seconds if self.total_seconds > 0 else 0
         if self.progress_circle:
             circle_x, circle_y, circle_radius = self.center_x, self.center_y, min(self.width, self.height) / 3
             self.progress_circle.circle = (circle_x, circle_y, circle_radius, 0, 360 * percent)
+
+    def reset_to_no_mayhem(self):
+        self.target_datetime = None
+        self.label.text = "NO MAYHEM SCHEDULED"
+        self.label.color = (1, 0, 0, 1)
+        if self.progress_circle:
+            self.progress_circle.circle = (self.center_x, self.center_y, 100, 0, 0)
+        if self.glow_event:
+            self.glow_event.cancel()
+            self.glow_event = None
+        Clock.unschedule(self.update_countdown)
 
     def get_countdown_target(self):
         try:
@@ -249,6 +605,11 @@ class CountdownWidget(BoxLayout):
             result = cursor.fetchone()
             cursor.close()
             if result and result[0]:
+                # Handle both string and datetime from DB
+                if isinstance(result[0], str) and result[0] == self.DUMMY_NO_MAYHEM:
+                    return None  # No mayhem scheduled
+                if isinstance(result[0], datetime) and result[0].strftime("%Y-%m-%d %H:%M:%S") == self.DUMMY_NO_MAYHEM:
+                    return None
                 return result[0]
             return None
         except Exception as e:
@@ -257,18 +618,23 @@ class CountdownWidget(BoxLayout):
 
     def check_for_update(self, dt):
         new_target_str = self.get_countdown_target()
+        if not new_target_str:
+            self.reset_to_no_mayhem()
+            return
 
-        if new_target_str:
-            if isinstance(new_target_str, str):
-                new_target_dt = datetime.strptime(new_target_str, "%Y-%m-%d %H:%M:%S")
-            else:
-                new_target_dt = new_target_str  # Already a datetime object
+        # If already a datetime object, use it directly
+        if isinstance(new_target_str, datetime):
+            new_target_dt = new_target_str
+        else:
+            new_target_dt = datetime.strptime(new_target_str, "%Y-%m-%d %H:%M:%S")
 
+        # Localize if not already timezone-aware
+        if new_target_dt.tzinfo is None or new_target_dt.tzinfo.utcoffset(new_target_dt) is None:
             new_target_dt = self.target_timezone.localize(new_target_dt)
 
-            if new_target_dt != self.target_datetime:
-                print("Countdown target updated!")
-                self.start_countdown(new_target_dt)
+        if self.target_datetime is None or new_target_dt != self.target_datetime:
+            print("Countdown target updated!")
+            self.start_countdown(new_target_dt)
 
     def animate_glow(self, dt):
         r, g, b, a = self.label.color
@@ -282,13 +648,17 @@ class CountdownWidget(BoxLayout):
             self.progress_circle.pos = self.pos
             self.progress_circle.size = self.size
 
-
-
     def start_countdown(self, target_datetime):
+        # If dummy/no-mayhem, reset and do not start countdown
+        if (not target_datetime or
+            (isinstance(target_datetime, str) and target_datetime == self.DUMMY_NO_MAYHEM) or
+            (isinstance(target_datetime, datetime) and target_datetime.strftime("%Y-%m-%d %H:%M:%S") == self.DUMMY_NO_MAYHEM)):
+            self.reset_to_no_mayhem()
+            return
+
         if isinstance(target_datetime, str):
             target_datetime = datetime.strptime(target_datetime, "%Y-%m-%d %H:%M:%S")
 
-        # Only localize if it’s naive (has no timezone)
         if target_datetime.tzinfo is None or target_datetime.tzinfo.utcoffset(target_datetime) is None:
             self.target_datetime = self.target_timezone.localize(target_datetime)
         else:
@@ -567,25 +937,62 @@ def style_button(button):
     button.color = (1, 1, 1, 1)
 
 
-def get_tier(rating):
-    if rating < 21:
-        return "Bronze"
-    elif rating < 41:
-        return "Silver"
-    elif rating < 61:
-        return "Gold"
-    elif rating < 81:
-        return "Platinum"
-    elif rating < 101:
-        return "Diamond"
-    elif rating < 121:
-        return "Master"
-    elif rating < 141:
-        return "Grandmaster"
-    elif rating < 201:
-        return "Challenger"
-    else:
-        return "Legend"  # For ratings above Challenger
+
+TIER_DEFINITIONS = [
+    {"name": "Bronze", "min": 0.0, "max": 4.0, "badge": "bronze_badge.png"},
+    {"name": "Silver", "min": 4.0, "max": 6.5, "badge": "silver_badge.png"},
+    {"name": "Gold", "min": 6.5, "max": 8.5, "badge": "gold_badge.png"},
+    {"name": "Master", "min": 8.5, "max": None, "badge": "master_badge.png"},  # No upper limit
+]
+
+
+class SaveAsFileChooserPopup(Popup):
+    def __init__(self, title, on_save, default_name="players_save.json", **kwargs):
+        super().__init__(**kwargs)
+        self.title = title
+        self.size_hint = (0.95, 0.95)
+        self.auto_dismiss = False
+        self.on_save = on_save
+
+        layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        # FileChooser
+        self.filechooser = FileChooserIconView(
+            filters=['*.json'],
+            path=os.path.expanduser("~/Documents")
+        )
+        layout.add_widget(self.filechooser)
+
+        # Filename input
+        file_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
+        file_row.add_widget(Label(text="File name:", size_hint_x=0.3))
+        self.filename_input = TextInput(text=default_name, multiline=False, size_hint_x=0.7)
+        file_row.add_widget(self.filename_input)
+        layout.add_widget(file_row)
+
+        # Buttons
+        btn_layout = BoxLayout(size_hint_y=None, height=50, spacing=10)
+        save_btn = Button(text="Save")
+        cancel_btn = Button(text="Cancel")
+        btn_layout.add_widget(save_btn)
+        btn_layout.add_widget(cancel_btn)
+        layout.add_widget(btn_layout)
+        self.add_widget(layout)
+
+        save_btn.bind(on_release=self.do_save)
+        cancel_btn.bind(on_release=lambda x: self.dismiss())
+
+    def do_save(self, instance):
+        directory = self.filechooser.path
+        filename = self.filename_input.text.strip()
+        if not filename:
+            return
+        if not filename.endswith(".json"):
+            filename += ".json"
+        file_path = os.path.join(directory, filename)
+        self.dismiss()
+        self.on_save(file_path)
+
 
 
 
@@ -631,6 +1038,8 @@ class SkillRatingApp(MDApp):
 
         self.persistent_music_folder = os.path.join(os.path.expanduser("~"), "Documents", "MyApp", "music")
         os.makedirs(self.persistent_music_folder, exist_ok=True)
+
+
 
     def ensure_music_folder_exists(self):
         try:
@@ -710,12 +1119,12 @@ class SkillRatingApp(MDApp):
 
     def retry_check_app_version(self):
         try:
-            self.check_app_version(APP_VERSION="1.0.0")
+            self.check_app_version(APP_VERSION="2.0.0")
         except Exception as e:
             print(f"Retry version check failed: {e}")
             self.show_no_connection_popup()
 
-    def check_app_version(self, APP_VERSION="1.0.0"):
+    def check_app_version(self, APP_VERSION="2.0.0"):
         try:
             if getattr(sys, 'frozen', False):
                 dotenv_path = os.path.join(sys._MEIPASS, '.env')
@@ -840,7 +1249,7 @@ class SkillRatingApp(MDApp):
             # Store label for updating messages on retry failure
             self.popup_label = label
         else:
-            # If popup exists, just update the message
+            # If popup exists, update the message
             self.popup_label.text = f"Database connection failed:\n{error_message}\n\nPlease check your internet connection."
 
         retry_button.bind(on_press=self.try_again_connection)
@@ -851,7 +1260,7 @@ class SkillRatingApp(MDApp):
     def try_again_connection(self, *args):
         print("[INFO] Retrying database connection...")
         try:
-            self.check_app_version(APP_VERSION="1.0.0")
+            self.check_app_version(APP_VERSION="2.0.0")
             if self.conn:
                 print("[INFO] Reconnection successful.")
                 self.popup.dismiss()
@@ -988,7 +1397,7 @@ class SkillRatingApp(MDApp):
                 )
             ''')
 
-            # ✅ NEW: App Version Control Table
+            #  App Version Control Table
             cursor.execute('''
                        CREATE TABLE IF NOT EXISTS app_version_control (
                            id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1027,24 +1436,30 @@ class SkillRatingApp(MDApp):
             self.snowflakes.append(snowflake)
 
     def fetch_top_players(self):
-        if self.conn is None:
-            print("Database connection is not established. Cannot fetch top players.")
-            return
-
         try:
-            cursor = self.conn.cursor()
+            # Always create a new DB connection for fresh data
+            conn = mysql.connector.connect(
+                host=DB_HOST,
+                user=DB_USERNAME,
+                password=DB_PASSWORD,
+                database=DB_NAME,
+                port=DB_PORT
+            )
+            cursor = conn.cursor()
             cursor.execute('''
                    SELECT player_name, 
                           final_skill_rating,
                           COALESCE(kills, 0) AS kills,
                           COALESCE(flags_captured, 0) AS flags_captured,
-                          COALESCE(country_flag, 'flags/default.png') AS country_flag
+                          COALESCE(country_flag, 'default.png') AS country_flag
                    FROM overall_player_skill_rating
                    ORDER BY final_skill_rating DESC
                    LIMIT 3
                ''')
             results = cursor.fetchall()
             print("Fetched results:", results)  # Debugging line
+            conn.close()  # Always close the connection!
+
             self.top_players_container.clear_widgets()
 
             for idx, row in enumerate(results):
@@ -1100,18 +1515,62 @@ class SkillRatingApp(MDApp):
             print(f"Error occurred: {err}")
             self.show_popup("Error", str(err))
 
-
-
-
-
-
     def show_popup(self, title, message):
-        popup = Popup(title=title, content=Label(text=message), size_hint=(0.6, 0.4))
+        layout = BoxLayout(orientation='vertical', padding=10)
+
+        label = Label(
+            text=message,
+            text_size=(500, None),  # Set max width for wrapping
+            size_hint_y=None,
+            halign='left',
+            valign='top'
+        )
+        label.bind(texture_size=label.setter('size'))  # Resize to fit content
+
+        scroll = ScrollView(size_hint=(1, 1))
+        scroll.add_widget(label)
+
+        layout.add_widget(scroll)
+
+        popup = Popup(
+            title=title,
+            content=layout,
+            size_hint=(0.8, 0.5),
+            auto_dismiss=True
+        )
         popup.open()
 
+    def start_loading(self, button, original_text):
+        button.disabled = True
+        button.text = "Loading"
+        button._dots = 0
+        button._original_text = original_text
+        button._loading_event = Clock.schedule_interval(lambda dt: self.animate_dots(button), 0.5)
+
+    def stop_loading(self, button):
+        if hasattr(button, "_loading_event"):
+            button._loading_event.cancel()
+        button.text = button._original_text
+        button.disabled = False
+
+    def animate_dots(self, button):
+        button._dots = (button._dots + 1) % 4
+        button.text = "Loading" + "." * button._dots
+
+
+
+
     def build(self):
+        self.root = FloatLayout()
+        self.splash = FurySplashScreen(self.show_main_ui)
+        self.root.add_widget(self.splash)
+        return self.root
+
+    def show_main_ui(self):
+        self.root.remove_widget(self.splash)
+
         try:
-            self.check_app_version(APP_VERSION="1.0.0")
+            self.check_app_version(APP_VERSION="2.0.0")
         except Exception as e:
             print(f"Startup error: {e}")
             Clock.schedule_once(lambda dt: self.show_no_connection_popup(), 0)
@@ -1164,22 +1623,31 @@ class SkillRatingApp(MDApp):
             fireball = Fireball(self.main_layout.canvas, Window.width)
             self.fireballs.append(fireball)
 
+        self.bg_images = [
+            resource_path('positions/tank.png'),
+            resource_path('positions/tank1.png'),
+            resource_path('positions/tank2.png'),
+            resource_path('positions/tank3.png'),
+            resource_path('positions/tank4.png'),
+            resource_path('positions/tank5.png')
+        ]
+
+        self.bg_index = 0
+
         # Add background image at the bottom of the screen
         self.background_image = Image(
-          #  source=resource_path('positions/tank.png'),
-            source=img_path,
+            #  source=resource_path('positions/tank.png'),
+            source=self.bg_images[self.bg_index],
             allow_stretch=True,
             keep_ratio=True,
             size_hint=(1, None),  # Full width, height to be defined
-            size=(Window.width, 900),  # Set a fixed height for the background image
+            size=(Window.width, 800),  # Set a fixed height for the background image
             pos_hint={'x': 0, 'y': 0}  # Positioning it at the bottom
         )
         self.main_layout.add_widget(self.background_image)
-
+        Clock.schedule_interval(self.update_bg_image, 60)
         # Create an overlay layout for all UI components
         overlay = BoxLayout(orientation='vertical', size_hint=(1, None), height=00)  # Use fixed height for overlay
-
-
 
         # Create header section
         self.create_header()
@@ -1196,8 +1664,6 @@ class SkillRatingApp(MDApp):
         # Add it to the main layout
         self.main_layout.add_widget(self.mayham_label)
 
-
-
         self.achievement_label = RotatableLabel(
             text=" Top Achievements",
             color=(0.0, 1.0, 0.0, 1.0),
@@ -1212,11 +1678,6 @@ class SkillRatingApp(MDApp):
 
         self.show_animated_stats()
 
-
-
-
-
-
         self.create_db()
 
         self.countdown_widget = CountdownWidget(
@@ -1225,14 +1686,13 @@ class SkillRatingApp(MDApp):
             size_hint=(None, None),
             size=(250, 50),
             pos_hint={'x': 0.65, 'top': 0.95},
-            conn = self.conn
+            conn=self.conn
         )
         self.main_layout.add_widget(self.countdown_widget)
 
         new_target = self.get_countdown_target()
         if new_target:
             self.countdown_widget.start_countdown(new_target)
-
 
         # Add refresh button with GIF
         self.refresh_button = self.create_refresh_button()
@@ -1261,7 +1721,7 @@ class SkillRatingApp(MDApp):
             width=180
         )
         self.top_players_label.font_size = 24
-      #  self.top_players_label.font_name =  resource_path(os.path.join("fonts", "DancingScript.ttf"))
+        #  self.top_players_label.font_name =  resource_path(os.path.join("fonts", "DancingScript.ttf"))
         self.top_players_layout.add_widget(self.top_players_label)
 
         # Add glowing animation to top players label
@@ -1270,7 +1730,6 @@ class SkillRatingApp(MDApp):
 
         # Add glowing animation to mayhem label as well
         self.start_breathing_glow(self.mayham_label)
-
 
         # Spacer below the label
         spacer = Label(size_hint_y=None, height=10)
@@ -1298,7 +1757,7 @@ class SkillRatingApp(MDApp):
 
         # Create buttons
         self.create_players_button = Button(text='Admin Panel', size_hint_x=None, width=150)
-      #  self.create_players_button.bind(on_press=self.open_create_player_popup)
+        #  self.create_players_button.bind(on_press=self.open_create_player_popup)
         self.create_players_button.bind(
             on_press=lambda instance: self.prompt_admin_password(lambda: self.open_create_player_popup(instance)))
         style_button(self.create_players_button)
@@ -1371,7 +1830,7 @@ class SkillRatingApp(MDApp):
             self.video_player = YouTubeVideoPlayer(video_id, thumbnail_path, self.music_control_button)
         else:
             fallback_thumbnail = resource_find(resource_path("positions/default_thumbnail.jpg"))
-            self.video_player = YouTubeVideoPlayer(video_id, fallback_thumbnail,self.music_control_button)
+            self.video_player = YouTubeVideoPlayer(video_id, fallback_thumbnail, self.music_control_button)
         print("Thumbnail path:", resource_path("positions/default_thumbnail.jpg"))
 
         if self.video_player not in self.video_player_layout.children:
@@ -1385,7 +1844,7 @@ class SkillRatingApp(MDApp):
             background_down=resource_path('positions/refresh.png'),
             size_hint=(None, None),
             size=(50, 50),
-            pos_hint={'center_x': 0.120, 'center_y': 0.45}
+            pos_hint={'center_x': 0.04, 'center_y': 0.44}
         )
         self.refresh_button.bind(on_press=self.animate_refresh)
         self.refresh_button.bind(on_press=self.on_button_press)
@@ -1394,6 +1853,63 @@ class SkillRatingApp(MDApp):
         self.main_layout.add_widget(self.refresh_button)
 
         self.main_layout.add_widget(self.video_player_layout)
+
+        self.seasons_button = Button(
+            background_normal=resource_path('positions/seasons.png'),
+            background_down=resource_path('positions/seasons.png'),
+            size_hint=(None, None),
+            size=(200, 180),
+            pos_hint={'center_x': 0.125, 'center_y': 0.35}
+        )
+        self.seasons_button.bind(on_press=self.show_season_selector)
+        self.seasons_button.bind(on_press=self.on_button_press)
+        self.seasons_button.bind(on_release=self.on_button_release)
+        self.main_layout.add_widget(self.seasons_button)
+
+
+
+        self.load_btn = ImageButton(
+            source=resource_path('positions/upload.png'),
+            size_hint=(None, None),
+            size=(80, 50),  # Match image's actual aspect
+            pos_hint={'center_x': 0.75, 'center_y': 0.770},
+            allow_stretch=True,
+            keep_ratio=True
+        )
+
+        self.load_btn.bind(on_press=lambda x: self.load_player_inputs())
+        self.main_layout.add_widget(self.load_btn)
+
+        self.sv_btn = Button(
+            background_normal=resource_path('positions/save.png'),
+            background_down=resource_path('positions/save.png'),
+            size_hint=(None, None),
+            size=(80, 80),
+            pos_hint={'center_x': 0.698, 'center_y': 0.770}
+        )
+
+        self.sv_btn.bind(on_press=lambda x: self.save_player_inputs())
+        self.main_layout.add_widget(self.sv_btn)
+
+        self.ocr_upload_btn = ImageButton(
+            source=resource_path('positions/uploadImage.png'),
+            size_hint=(None, None),
+            size=(65, 65),  # Match your image aspect ratio if possible
+            pos_hint={'center_x': 0.725, 'center_y': 0.85},
+            allow_stretch=True,
+            keep_ratio=True
+        )
+
+        # Change the button's on_press to prompt the admin password before calling open_ocr_filechooser
+        self.ocr_upload_btn.bind(on_press=lambda x: self.prompt_admin_password(self.open_ocr_filechooser))
+
+        self.main_layout.add_widget(self.ocr_upload_btn)
+
+
+
+
+
+
 
         # Create Home button
         self.home_button = Button(
@@ -1411,7 +1927,47 @@ class SkillRatingApp(MDApp):
         self.main_layout.add_widget(self.home_button)  # Add the button to the main layout
         print(self.main_layout.children)
 
-        return self.main_layout
+        self.root.add_widget(self.main_layout)
+
+
+
+
+
+    def update_bg_image(self, dt):
+        self.bg_index = (self.bg_index + 1) % len(self.bg_images)
+        self.background_image.source = self.bg_images[self.bg_index]
+        self.background_image.reload()
+
+
+    def process_ocr_image(self, file_path):
+        try:
+            result = ocr_api_request(file_path)
+            ocr_text = result['results'][0]['entities'][0]['objects'][0]['entities'][0]['text']
+            player_json = parse_leaderboard_text(ocr_text)
+            self.prompt_save_generated_json(player_json)
+        except Exception as e:
+            self.show_popup("Error", f"OCR failed: {e}")
+
+    def prompt_save_generated_json(self, player_json):
+        def on_save(file_path):
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(player_json, f, indent=2)
+                self.show_popup("Saved", f"OCR player data saved to {file_path}")
+            except Exception as e:
+                self.show_popup("Error", f"Failed to save file: {e}")
+
+        popup = SaveAsFileChooserPopup("Save OCR Player Data As", on_save, default_name="players_save.json")
+        popup.open()
+
+    def open_ocr_filechooser(self):
+        def on_image_selected(file_path):
+            self.process_ocr_image(file_path)
+
+        popup = FileChooserPopup("Select Leaderboard Image", on_image_selected)
+        popup.filechooser.filters = ['*.png', '*.jpg', '*.jpeg', '*.bmp']
+        popup.open()
+
 
     def get_highest_stats_sentences(self):
         cursor = self.conn.cursor()
@@ -1460,7 +2016,7 @@ class SkillRatingApp(MDApp):
         if win_rate_row and win_rate_row[0] is not None and win_rate_row[1] is not None:
             red_win = win_rate_row[0]
             blue_win = win_rate_row[1]
-            if abs(red_win - blue_win) < 1e-6:  # practically equal
+            if abs(red_win - blue_win) < 1e-6:
                 win_rate_sentence = (
                     "Did you know there is no advantage \n\n"
                     "specifically being in red or blue team \n\n"
@@ -1489,12 +2045,28 @@ class SkillRatingApp(MDApp):
 
         cursor.close()
 
+        # Additional static facts
+        assist_fact = (
+
+            "You get a lot of assist points \n\nbased"
+            "on your proximity\n\n to your team's flagger"
+            "and the\n\n opponent's proximity to the flag!"
+        )
+
+        streak_fact = (
+            "You can earn more XP\n\n"
+            "by killing someone who\n\n"
+            "was on a kill streak!"
+        )
+
         return [
             kill_sentence,
             flag_sentence,
             xp_sentence,
             win_rate_sentence,
-            match_count_sentence
+            match_count_sentence,
+            assist_fact,
+            streak_fact
         ]
 
     def show_animated_stats(self):
@@ -1558,28 +2130,25 @@ class SkillRatingApp(MDApp):
             return result[0]  # Returns a datetime string
         return None
 
-
     def prompt_admin_password(self, callback):
-        # Function to fetch the stored admin password from the database
+        # Function to fetch the stored hashed admin password from the database
         def fetch_stored_password():
             try:
                 cursor = self.conn.cursor()
-                cursor.execute("SELECT password FROM admin_credentials WHERE id = 1")  # Adjust the query as needed
+                cursor.execute("SELECT password FROM admin_credentials WHERE id = 1")
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return result[0] if result else None  # Return as a string, not bytes
             except Exception as e:
                 self.show_popup("Database Error", f"Failed to fetch admin password: {e}")
                 return None
 
-        # Fetch the stored password
-        stored_password = fetch_stored_password()
-        if stored_password is None:
+        # Fetch the stored hashed password
+        stored_hashed_password = fetch_stored_password()
+        if stored_hashed_password is None:
             return  # Stop execution if password couldn't be fetched
 
-        # Layout for the password input and buttons
         layout = BoxLayout(orientation='vertical', padding=10, spacing=8)
 
-        # Password input field
         pw_input = TextInput(
             password=True,
             multiline=False,
@@ -1590,7 +2159,6 @@ class SkillRatingApp(MDApp):
         )
         layout.add_widget(pw_input)
 
-        # Buttons layout
         btns = BoxLayout(size_hint_y=None, height=40, spacing=10)
         ok_btn = Button(text="OK", size_hint_x=0.5)
         cancel_btn = Button(text="Cancel", size_hint_x=0.5)
@@ -1599,23 +2167,22 @@ class SkillRatingApp(MDApp):
         btns.add_widget(cancel_btn)
         layout.add_widget(btns)
 
-        # Create popup
         popup = Popup(
             title="Admin Access",
             content=layout,
-            size_hint=(0.35, 0.25),  # Smaller popup
+            size_hint=(0.35, 0.25),
             auto_dismiss=False
         )
 
-        # Define what happens when "OK" is clicked
         def on_ok(instance):
-            if pw_input.text == stored_password:  # Check the input against the stored password
+            input_password = pw_input.text.encode('utf-8')  # Encode the input password as bytes
+            # Compare the hashed input password with the stored hashed password
+            if bcrypt.checkpw(input_password, stored_hashed_password.encode('utf-8')):  # Make sure both are bytes
                 popup.dismiss()
-                callback()  # Call the original function (e.g., open_create_player_popup)
+                callback()  # Execute the callback on success
             else:
                 self.show_popup("Access Denied", "Incorrect admin password.")
 
-        # Bind button actions
         ok_btn.bind(on_press=on_ok)
         cancel_btn.bind(on_press=lambda x: popup.dismiss())
 
@@ -1902,7 +2469,7 @@ class SkillRatingApp(MDApp):
         layout = FloatLayout(size=(750, 740))  # Set layout size to the size of your app window.
 
         # Set an absolute position (x, y in pixels)
-        self.gif_button.pos = (850, 750)  # Change these values as needed (x, y)
+        self.gif_button.pos = (50, 670)  # Change these values as needed (x, y)
 
         layout.add_widget(self.gif_button)  # Add the GIF to the layout
         return layout
@@ -1934,21 +2501,36 @@ class SkillRatingApp(MDApp):
     def hide_gif(self, dt):
         self.gif_button.opacity = 0.85  # Make the GIF invisible
 
+
+
     def calculate_totals(self):
         try:
-            cursor = self.conn.cursor()
+            # Always create a new DB connection for fresh data
+            conn = mysql.connector.connect(
+                host=DB_HOST,
+                user=DB_USERNAME,
+                password=DB_PASSWORD,
+                database=DB_NAME,
+                port=DB_PORT
+            )
+            cursor = conn.cursor()
 
             # Calculate Total Games
             cursor.execute("SELECT COUNT(*) FROM matches")
             total_games = cursor.fetchone()[0]
+            print(f"[Totals] Total Games: {total_games}")
 
             # Calculate Total Kills
             cursor.execute("SELECT SUM(kills) FROM overall_player_skill_rating")
             total_kills = cursor.fetchone()[0] or 0  # Default to 0 if None
+            print(f"[Totals] Total Kills: {total_kills}")
 
             # Calculate Total Flags
             cursor.execute("SELECT SUM(flags_captured) FROM overall_player_skill_rating")
             total_flags = cursor.fetchone()[0] or 0  # Default to 0 if None
+            print(f"[Totals] Total Flags: {total_flags}")
+
+            conn.close()  # Always close the connection!
 
             # Animate the totals
             self.animate_count_up(self.total_games_label, total_games)
@@ -1965,69 +2547,86 @@ class SkillRatingApp(MDApp):
         # --- Countdown Target with Spinners ---
         countdown_label = Label(text="Set Game Starting time in EDT:", size_hint_y=None, height=30)
 
-        # Year Spinner
         current_year = datetime.now().year
         self.year_spinner = Spinner(
             text=str(current_year),
             values=[str(y) for y in range(current_year, current_year + 5)],
             size_hint_y=None, height=40
         )
-
-        # Month Spinner
         self.month_spinner = Spinner(
             text="01",
             values=[f"{m:02}" for m in range(1, 13)],
             size_hint_y=None, height=40
         )
-
-        # Day Spinner
         self.day_spinner = Spinner(
             text="01",
             values=[f"{d:02}" for d in range(1, 32)],
             size_hint_y=None, height=40
         )
-
-        # Hour Spinner
         self.hour_spinner = Spinner(
             text="00",
             values=[f"{h:02}" for h in range(0, 24)],
             size_hint_y=None, height=40
         )
-
-        # Minute Spinner
         self.minute_spinner = Spinner(
             text="00",
             values=[f"{m:02}" for m in range(0, 60)],
             size_hint_y=None, height=40
         )
-
-        # Second Spinner
         self.second_spinner = Spinner(
             text="00",
             values=[f"{s:02}" for s in range(0, 60)],
             size_hint_y=None, height=40
         )
 
-        # Layout for date
         date_spinner_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
         date_spinner_layout.add_widget(self.year_spinner)
         date_spinner_layout.add_widget(self.month_spinner)
         date_spinner_layout.add_widget(self.day_spinner)
 
-        # Layout for time
         time_spinner_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
         time_spinner_layout.add_widget(self.hour_spinner)
         time_spinner_layout.add_widget(self.minute_spinner)
         time_spinner_layout.add_widget(self.second_spinner)
 
-        # Add a "No Mayhem Scheduled" checkbox
-        self.no_mayhem_checkbox = CheckBox(active=False)
-        no_mayhem_label = Label(text="No Mayhem Scheduled", size_hint_y=None, height=30)
-        no_mayhem_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
-        no_mayhem_layout.add_widget(self.no_mayhem_checkbox)
-        no_mayhem_layout.add_widget(no_mayhem_label)
+        self.no_mayhem_checkbox = CheckBox(size_hint_x=None, width=40)
 
-        # Add it to the input_layout
+        no_mayhem_label = Label(
+            text="No Mayhem Scheduled",
+            size_hint=(None, None),
+            size=(160, 40),  # Match layout height (40)
+            halign='right',
+            valign='middle',
+            text_size=(160, 40)  # Match label size exactly
+        )
+        no_mayhem_label.bind(size=no_mayhem_label.setter('text_size'))  # Keeps text centered
+
+        no_mayhem_layout = BoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=40,
+            spacing=5
+        )
+
+        # Add label first, then checkbox
+        no_mayhem_layout.add_widget(no_mayhem_label)
+        no_mayhem_layout.add_widget(self.no_mayhem_checkbox)
+
+        # Add a spacer before the button to push it to the right
+
+        # Add a small vertical spacer to push the END SEASON button downward
+        input_layout.add_widget(Widget(size_hint_y=None, height=100))
+
+        end_season_button = Button(
+            text="END the SEASON",
+            size_hint=(None, None),
+            background_color=(1, 0, 0, 1),
+            pos_hint={'x': 0.68, 'y': 0.50},
+            size=(250, 70),
+        )
+
+        input_layout.add_widget(end_season_button)
+        end_season_button.bind(on_press=self.end_season)
         input_layout.add_widget(no_mayhem_layout)
 
         countdown_button_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
@@ -2036,58 +2635,27 @@ class SkillRatingApp(MDApp):
 
         def set_countdown_target(instance):
             try:
-                # Check if No Mayhem Scheduled is checked
                 if self.no_mayhem_checkbox.active:
-                    self.reset_countdown()  # Reset countdown
+                    self.reset_countdown()
                     self.show_popup("No Mayhem Scheduled", "Set to No Schedule")
+                    return
 
-                    return  # Exit the function without setting the countdown if checkbox is checked
-
-                # Debugging: Check spinner states
-                print(
-                    f"Year Spinner: {self.year_spinner}, Value: {self.year_spinner.text if self.year_spinner else 'None'}")
-                print(
-                    f"Month Spinner: {self.month_spinner}, Value: {self.month_spinner.text if self.month_spinner else 'None'}")
-                print(
-                    f"Day Spinner: {self.day_spinner}, Value: {self.day_spinner.text if self.day_spinner else 'None'}")
-                print(
-                    f"Hour Spinner: {self.hour_spinner}, Value: {self.hour_spinner.text if self.hour_spinner else 'None'}")
-                print(
-                    f"Minute Spinner: {self.minute_spinner}, Value: {self.minute_spinner.text if self.minute_spinner else 'None'}")
-                print(
-                    f"Second Spinner: {self.second_spinner}, Value: {self.second_spinner.text if self.second_spinner else 'None'}")
-
-                # Check if any spinner is missing or None
                 if any([
-                    not self.year_spinner or not self.year_spinner.text,
-                    not self.month_spinner or not self.month_spinner.text,
-                    not self.day_spinner or not self.day_spinner.text,
-                    not self.hour_spinner or not self.hour_spinner.text,
-                    not self.minute_spinner or not self.minute_spinner.text,
-                    not self.second_spinner or not self.second_spinner.text
+                    not self.year_spinner.text,
+                    not self.month_spinner.text,
+                    not self.day_spinner.text,
+                    not self.hour_spinner.text,
+                    not self.minute_spinner.text,
+                    not self.second_spinner.text
                 ]):
                     raise ValueError("One or more spinner values are missing or invalid.")
 
-                # Print spinner values to debug
-                print(f"Year: {self.year_spinner.text}, Month: {self.month_spinner.text}, "
-                      f"Day: {self.day_spinner.text}, Hour: {self.hour_spinner.text}, "
-                      f"Minute: {self.minute_spinner.text}, Second: {self.second_spinner.text}")
-
-                # Regular countdown target setting
                 date_part = f"{self.year_spinner.text}-{self.month_spinner.text}-{self.day_spinner.text}"
                 time_part = f"{self.hour_spinner.text}:{self.minute_spinner.text}:{self.second_spinner.text}"
                 full_datetime = f"{date_part} {time_part}"
 
-                # Validate datetime
-                print(f"Attempting to parse datetime: {full_datetime}")
-                try:
-                    dt = datetime.strptime(full_datetime, "%Y-%m-%d %H:%M:%S")
-                    print(f"Parsed datetime: {dt}")
-                except Exception as e:
-                    print(f"Datetime parsing error: {e}")
-                    raise
+                dt = datetime.strptime(full_datetime, "%Y-%m-%d %H:%M:%S")
 
-                # Insert the countdown to the database
                 cursor = self.conn.cursor()
                 cursor.execute(
                     "INSERT INTO countdown (id, countdown_to) VALUES (%s, %s) "
@@ -2097,7 +2665,6 @@ class SkillRatingApp(MDApp):
                 self.conn.commit()
                 self.show_popup("Success", f"Countdown updated to {full_datetime}")
             except Exception as e:
-                print(f"Error occurred: {e}")
                 self.show_popup("Error", f"Failed to update countdown: {e}")
 
         countdown_ok.bind(on_press=set_countdown_target)
@@ -2113,34 +2680,43 @@ class SkillRatingApp(MDApp):
         countdown_button_layout.add_widget(countdown_ok)
         countdown_button_layout.add_widget(countdown_cancel)
 
-        # Add everything to input layout
         input_layout.add_widget(countdown_label)
         input_layout.add_widget(date_spinner_layout)
         input_layout.add_widget(time_spinner_layout)
         input_layout.add_widget(countdown_button_layout)
 
-        # --- Reset Admin Password section ---
-        reset_pw_label = Label(text="Reset Admin Password:", size_hint_y=None, height=30)
-        self.reset_password_input = TextInput(multiline=False, size_hint_y=None, height=40, password=True)
 
-        reset_pw_button_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
+        # --- Reset Admin Password section (reduced width, moved to left half) ---
+        pw_reset_row = BoxLayout(orientation='horizontal', size_hint_y=None, height=110, spacing=10)
+
+        # Left half: Password reset
+        pw_reset_left = BoxLayout(orientation='vertical', size_hint_x=0.5, spacing=4)
+        reset_pw_label = Label(text="Reset Admin Password:", size_hint_y=None, height=24)
+        self.reset_password_input = TextInput(multiline=False, size_hint_y=None, height=32, password=True)
+
+        reset_pw_button_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=32, spacing=6)
         reset_ok = Button(text="OK", size_hint_x=0.5)
         reset_cancel = Button(text="Cancel", size_hint_x=0.5)
         reset_cancel.bind(on_press=lambda x: setattr(self.reset_password_input, 'text', ''))
 
-        # --- Actual Reset Logic ---
         def reset_admin_password(instance):
             new_password = self.reset_password_input.text.strip()
             if not new_password:
                 self.show_popup("Error", "Password cannot be empty.")
                 return
-
             try:
+                import bcrypt
+                hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
+                hashed_str = hashed.decode('utf-8')
+
                 cursor = self.conn.cursor()
-                # Ensure admin row exists. Using INSERT IGNORE (MySQL syntax); if not, adjust as needed.
-                cursor.execute("INSERT IGNORE INTO admin_credentials (id, password) VALUES (%s, %s)", (1, "default123"))
-                # Update password with %s placeholder
-                cursor.execute("UPDATE admin_credentials SET password = %s WHERE id = 1", (new_password,))
+                # Ensure row with id = 1 exists
+                cursor.execute("SELECT id FROM admin_credentials WHERE id = 1")
+                if not cursor.fetchone():
+                    cursor.execute("INSERT INTO admin_credentials (id, password) VALUES (%s, %s)", (1, hashed_str))
+                else:
+                    cursor.execute("UPDATE admin_credentials SET password = %s WHERE id = 1", (hashed_str,))
+
                 self.conn.commit()
                 self.show_popup("Success", "Admin password updated successfully.")
                 self.reset_password_input.text = ""
@@ -2151,9 +2727,52 @@ class SkillRatingApp(MDApp):
         reset_pw_button_layout.add_widget(reset_ok)
         reset_pw_button_layout.add_widget(reset_cancel)
 
-        input_layout.add_widget(reset_pw_label)
-        input_layout.add_widget(self.reset_password_input)
-        input_layout.add_widget(reset_pw_button_layout)
+        pw_reset_left.add_widget(reset_pw_label)
+        pw_reset_left.add_widget(self.reset_password_input)
+        pw_reset_left.add_widget(reset_pw_button_layout)
+
+        # Right half: Match Numbers dropdown and Revert button
+        pw_reset_right = BoxLayout(orientation='vertical', size_hint_x=0.5, spacing=8)
+        match_label = Label(text="Match Numbers:", size_hint_y=None, height=24)
+
+        # Fetch match numbers from the database
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT match_number FROM matches ORDER BY match_number")
+        match_numbers = [str(row[0]) for row in cursor.fetchall()]
+        if match_numbers:
+            default_match_text = match_numbers[0]
+        else:
+            default_match_text = "No Matches"
+
+        self.match_numbers_spinner = Spinner(
+            text=default_match_text,
+            values=match_numbers if match_numbers else ["No Matches"],
+            size_hint_y=None, height=40
+        )
+
+        # Input field label and TextInput for manual match number entry
+        input_label = Label(text="Enter Match No:", size_hint_y=None, height=24)
+        self.match_number_input = TextInput(multiline=False, size_hint_y=None, height=32, input_filter='int')
+
+        revert_button = Button(text="Revert by Match No", size_hint_y=None, height=40)
+
+        def revert_by_match_no(instance):
+            match_no = self.match_number_input.text.strip() or self.match_numbers_spinner.text
+            if not match_no.isdigit():
+                self.show_popup("Error", "Please enter or select a valid match number.")
+                return
+            self.revert_match_number(int(match_no))
+
+        revert_button.bind(on_press=revert_by_match_no)
+
+        pw_reset_right.add_widget(match_label)
+        pw_reset_right.add_widget(self.match_numbers_spinner)
+        pw_reset_right.add_widget(revert_button)
+
+        pw_reset_row.add_widget(pw_reset_left)
+        pw_reset_row.add_widget(pw_reset_right)
+
+        input_layout.add_widget(pw_reset_row)
 
         # --- MAYHEM Video URL field ---
         video_label = Label(text="MAYHEM Video URL:", size_hint_y=None, height=30)
@@ -2187,7 +2806,7 @@ class SkillRatingApp(MDApp):
             for player in existing_players:
                 player_name = player[0]
                 player_button = Button(text=player_name, size_hint_y=None, height=44)
-                player_button.bind(on_release=lambda btn: self.select_existing_player(btn.text))
+                player_button.bind(on_release=lambda btn: self.select_existing_player(btn.text, self.player_name_input))
                 self.dropdown.add_widget(player_button)
 
             self.player_dropdown_button = Button(text="See Existing Players", size_hint_y=None, height=40)
@@ -2206,7 +2825,6 @@ class SkillRatingApp(MDApp):
         delete_button = Button(text="Delete", size_hint_x=0.3)
 
         def confirm_delete():
-            """Prompt the user to confirm deletion of the player."""
             player_name = self.player_name_input.text.strip()
             if not player_name:
                 self.show_popup("Error", "Please enter a player name to delete.")
@@ -2215,8 +2833,8 @@ class SkillRatingApp(MDApp):
             confirmation_layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
             confirmation_label = Label(text=f"Are you sure you want to delete '{player_name}'?", size_hint_y=None,
                                        height=40)
-
             confirmation_layout.add_widget(confirmation_label)
+
             confirm_button = Button(text="Yes")
             confirm_cancel_button = Button(text="No")
 
@@ -2231,16 +2849,14 @@ class SkillRatingApp(MDApp):
                     cursor.execute('DELETE FROM overall_player_skill_rating WHERE player_name = %s', (player_name,))
                     self.conn.commit()
                     self.show_popup("Deleted", f"Player '{player_name}' deleted successfully.")
-                    self.player_name_input.text = ""  # Clear the input field after deletion
-                    self.player_name_popup.dismiss()
-                except mysql.connector.Error as err:
+                    self.player_name_input.text = ""
+                except Exception as err:
                     self.show_popup("Error", f"Could not delete player: {str(err)}")
-                confirm_popup.dismiss()  # Close confirmation popup
+                confirm_popup.dismiss()
 
             confirm_button.bind(on_press=on_confirm)
-            cancel_button.bind(on_press=lambda x: confirm_popup.dismiss())
-
-            confirm_popup.open()  # Open the confirmation popup
+            confirm_cancel_button.bind(on_press=lambda x: confirm_popup.dismiss())
+            confirm_popup.open()
 
         delete_button.bind(on_press=lambda x: confirm_delete())
 
@@ -2250,21 +2866,156 @@ class SkillRatingApp(MDApp):
 
         input_layout.add_widget(button_layout)
 
-        # Create close button for the popup
-        close_button = Button(text="Close", size_hint=(None, None), size=(90, 50), pos_hint={'top': 20.8, 'left':1 })
+        # Close button
+        close_button = Button(text="Close", size_hint=(None, None), size=(90, 50), pos_hint={'top': 1.1, 'left': 1})
         close_button.bind(on_press=lambda x: self.player_name_popup.dismiss())
-
-
         button_layout.add_widget(close_button)
-
 
         self.player_name_popup = Popup(title="Admin Panel", content=input_layout, size_hint=(0.7, 0.9))
         self.player_name_popup.open()
 
+    def revert_match_number(self, match_number):
+        try:
+            cursor = self.conn.cursor()
 
+            # 1. Find all player names for this match number
+            cursor.execute(
+                "SELECT player_name FROM player_skill_rating WHERE match_number = %s",
+                (match_number,)
+            )
+            player_names = [row[0] for row in cursor.fetchall()]
+            if not player_names:
+                self.show_popup("Info", f"No player data found for match number {match_number}.")
+                return
 
+            # 2. For each player, recalculate their overall stats *excluding* this match
+            for player_name in player_names:
+                # Get all stats for this player except the specified match
+                cursor.execute(
+                    "SELECT kills, flags_captured, xp, skill_rating, player_level, final_team, outcome "
+                    "FROM player_skill_rating WHERE player_name = %s AND match_number != %s",
+                    (player_name, match_number)
+                )
+                rows = cursor.fetchall()
+                total_matches = len(rows)
+                total_kills = sum(row[0] for row in rows)
+                total_flags = sum(row[1] for row in rows)
+                total_xp = sum(row[2] for row in rows)
+                total_skill_rating = sum(row[3] for row in rows)
+                last_level = rows[-1][4] if rows else 0
 
+                # Win ratios
+                total_wins = sum(1 for row in rows if row[6] == 'win')
+                red_wins = sum(1 for row in rows if row[5] == 'Red' and row[6] == 'win')
+                blue_wins = sum(1 for row in rows if row[5] == 'Blue' and row[6] == 'win')
+                overall_win_ratio = (total_wins / total_matches) * 100 if total_matches else 0
+                red_team_win_rate = (red_wins / total_matches) * 100 if total_matches else 0
+                blue_team_win_rate = (blue_wins / total_matches) * 100 if total_matches else 0
 
+                # Update overall_player_skill_rating
+                if total_matches == 0:
+                    # If no matches left, remove the player from overall table
+                    cursor.execute(
+                        "DELETE FROM overall_player_skill_rating WHERE player_name = %s",
+                        (player_name,)
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        UPDATE overall_player_skill_rating SET
+                            kills = %s,
+                            flags_captured = %s,
+                            xp = %s,
+                            final_skill_rating = %s,
+                            total_matches = %s,
+                            red_team_win_rate = %s,
+                            blue_team_win_rate = %s,
+                            overall_win_ratio = %s,
+                            last_updated_player_level = %s
+                        WHERE player_name = %s
+                        ''',
+                        (total_kills, total_flags, total_xp, total_skill_rating, total_matches,
+                         red_team_win_rate, blue_team_win_rate, overall_win_ratio, last_level, player_name)
+                    )
+
+            # 3. Remove entries in player_skill_rating for that match number
+            cursor.execute(
+                "DELETE FROM player_skill_rating WHERE match_number = %s",
+                (match_number,)
+            )
+
+            # 4. Remove entry in matches table
+            cursor.execute(
+                "DELETE FROM matches WHERE match_number = %s",
+                (match_number,)
+            )
+
+            self.conn.commit()
+            self.show_popup("Success", f"Reverted match number {match_number} and recalculated stats.")
+        except Exception as e:
+            self.conn.rollback()
+            self.show_popup("Error", f"Failed to revert match number {match_number}: {e}")
+
+    def end_season(self, instance):
+        try:
+            cursor = self.conn.cursor()
+
+            # Step 1: Check for existing season tables
+            cursor.execute("SHOW TABLES LIKE 'Player_skill_rating_season_%'")
+            existing_tables = cursor.fetchall()
+            season_numbers = [int(table[0].split('_')[-1]) for table in existing_tables]
+            next_season_number = max(season_numbers) + 1 if season_numbers else 1
+
+            # Step 2: Create the new season table
+            create_table_query = f"""
+            CREATE TABLE Player_skill_rating_season_{next_season_number} (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                player_name VARCHAR(255) NOT NULL UNIQUE,
+                kills INT NOT NULL DEFAULT 0,
+                xp INT NOT NULL DEFAULT 0,
+                flags_captured INT NOT NULL DEFAULT 0,
+                last_updated_player_level INT NOT NULL DEFAULT 0,
+                total_matches INT NOT NULL DEFAULT 0,
+                final_skill_rating FLOAT NOT NULL DEFAULT 0,
+                overall_win_ratio FLOAT NOT NULL DEFAULT 0,
+                red_team_win_rate FLOAT NOT NULL DEFAULT 0,
+                blue_team_win_rate FLOAT NOT NULL DEFAULT 0,
+                KPG INT NOT NULL DEFAULT 0,
+                FPG INT NOT NULL DEFAULT 0,
+                XPG INT NOT NULL DEFAULT 0,
+                country_flag VARCHAR(255) DEFAULT 'default.png'
+            )
+            """
+            cursor.execute(create_table_query)
+
+            # Step 3: Transfer data from overall_player_skill_rating to the new season table
+            transfer_query = f"""
+            INSERT INTO Player_skill_rating_season_{next_season_number} (
+                player_name, kills, xp, flags_captured, last_updated_player_level,
+                total_matches, final_skill_rating, overall_win_ratio,
+                red_team_win_rate, blue_team_win_rate, KPG, FPG, XPG, country_flag
+            )
+            SELECT
+                player_name, kills, xp, flags_captured, last_updated_player_level,
+                total_matches, final_skill_rating, overall_win_ratio,
+                red_team_win_rate, blue_team_win_rate, KPG, FPG, XPG, country_flag
+            FROM overall_player_skill_rating
+            """
+            cursor.execute(transfer_query)
+
+            # Step 4: Clear the current season table
+            cursor.execute("DELETE FROM overall_player_skill_rating")
+            self.conn.commit()
+
+            # Step 5: Optional logic – get max total matches from new table
+            cursor.execute(f"SELECT MAX(total_matches) FROM Player_skill_rating_season_{next_season_number}")
+            max_total_matches = cursor.fetchone()[0]
+
+            # Step 6: Notify success
+            self.show_popup("Season Ended", f"Season {next_season_number} ended. Data transferred successfully.")
+
+        except Exception as e:
+            self.show_popup("Error", f"Failed to end the season: {e}")
 
     def save_video_url(self, url):
         video_id = self.extract_video_id(url)
@@ -2309,26 +3060,12 @@ class SkillRatingApp(MDApp):
             )
             self.conn.commit()
 
-            # Reset the target datetime in the widget
-            self.target_datetime = None
+            # Tell the countdown widget to reset itself
+            self.countdown_widget.reset_to_no_mayhem()
 
-            # Reset the label text and progress circle when no mayhem is scheduled
-            if self.label:
-                self.label.text = "NO MAYHEM SCHEDULED"
-
-            if self.progress_circle:
-                self.progress_circle.circle = (self.center_x, self.center_y, 100, 0, 0)  # Reset progress circle
-
-            # Cancel any glowing animation if it exists
-            if self.glow_event:
-                self.glow_event.cancel()  # Cancel any glowing animation
-                self.glow_event = None
-
-            # Debugging: Confirm the reset
             print("Countdown reset successfully, 'No Mayhem Scheduled' displayed.")
 
         except Exception as e:
-            # Catch any errors during the reset process and display them in a popup
             print(f"Error occurred during reset: {e}")
             self.show_popup("Error", f"Failed to reset countdown: {e}")
 
@@ -2359,24 +3096,23 @@ class SkillRatingApp(MDApp):
         self.player_name_input.text = player_name  # Populate the input field with the existing player's name
         self.dropdown.dismiss()  # Close the dropdown after selection
 
+    import bcrypt
+
     def ask_for_create_admin_password(self, on_success_callback):
-        # Function to fetch the stored admin password from the database
         def fetch_stored_password():
             try:
                 cursor = self.conn.cursor()
-                cursor.execute("SELECT password FROM admin_credentials WHERE id = 1")  # Adjust the query as needed
+                cursor.execute("SELECT password FROM admin_credentials WHERE id = 1")
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return result[0].encode('utf-8') if result else None  # ensure bytes
             except Exception as e:
                 self.show_popup("Database Error", f"Failed to fetch admin password: {e}")
                 return None
 
-        # Fetch the stored password
-        stored_password = fetch_stored_password()
-        if stored_password is None:
-            return  # Stop execution if password couldn't be fetched
+        stored_password_hash = fetch_stored_password()
+        if stored_password_hash is None:
+            return
 
-        # Main layout for the popup content
         content = BoxLayout(orientation='vertical', spacing=10, padding=10)
         content.add_widget(Label(text="Enter Admin Password:"))
 
@@ -2388,22 +3124,20 @@ class SkillRatingApp(MDApp):
         cancel_button = Button(text="Cancel")
         button_layout.add_widget(ok_button)
         button_layout.add_widget(cancel_button)
-
         content.add_widget(button_layout)
 
         popup = Popup(title="Admin Authentication", content=content, size_hint=(0.4, 0.25))
 
-        # Validate the entered password
         def validate_password(instance):
-            if password_input.text == stored_password:
+            input_password = password_input.text.encode('utf-8')
+            if bcrypt.checkpw(input_password, stored_password_hash):
                 popup.dismiss()
-                on_success_callback()  # Callback function on successful authentication
+                on_success_callback()
             else:
                 self.show_popup("Access Denied", "Invalid admin password.")
 
         ok_button.bind(on_press=validate_password)
         cancel_button.bind(on_press=popup.dismiss)
-
         popup.open()
 
     def create_player(self, player_name):
@@ -2542,7 +3276,7 @@ class SkillRatingApp(MDApp):
         self.welcome_label.opacity = 1
 
         # Define the fade-out animation
-        fade_out = Animation(opacity=0, duration=10)  # Fade out over 2.5 seconds
+        fade_out = Animation(opacity=0, duration=15)  # Fade out over 2.5 seconds
 
         # Start the fade-out animation
         fade_out.start(self.welcome_label)
@@ -2653,7 +3387,9 @@ class SkillRatingApp(MDApp):
         return result[0] if result else None
 
     def ask_for_admin_password_for_flag_change(self, callback):
-        # Function to fetch the stored admin password from DB
+        import bcrypt  # Import bcrypt here or at the top of your file
+
+        # Function to fetch the stored hashed password from DB
         def fetch_stored_password():
             try:
                 cursor = self.conn.cursor()
@@ -2675,7 +3411,6 @@ class SkillRatingApp(MDApp):
             spacing=10
         )
 
-        # Label with instruction
         instruction_label = Label(
             text='Admin password required to change the flag:',
             size_hint_y=None,
@@ -2683,7 +3418,6 @@ class SkillRatingApp(MDApp):
         )
         password_content.add_widget(instruction_label)
 
-        # Password input field
         password_input = TextInput(
             multiline=False,
             password=True,
@@ -2694,13 +3428,11 @@ class SkillRatingApp(MDApp):
         )
         password_content.add_widget(password_input)
 
-        # Buttons container
         button_layout = BoxLayout(
             size_hint_y=None,
             height=40,
             spacing=10
         )
-
         confirm_button = Button(text='Confirm')
         cancel_button = Button(text='Cancel')
         button_layout.add_widget(confirm_button)
@@ -2708,7 +3440,6 @@ class SkillRatingApp(MDApp):
 
         password_content.add_widget(button_layout)
 
-        # Create the popup
         password_popup = Popup(
             title='Authorization Required',
             content=password_content,
@@ -2716,24 +3447,21 @@ class SkillRatingApp(MDApp):
             auto_dismiss=False
         )
 
-        # Confirmation logic
         def on_confirm(instance):
-            if password_input.text == stored_password:
+            user_input = password_input.text.strip()
+            if bcrypt.checkpw(user_input.encode('utf-8'), stored_password.encode('utf-8')):
                 password_popup.dismiss()
                 callback()
             else:
                 self.show_popup("Authentication Failed", "Incorrect admin password.")
                 password_popup.dismiss()
 
-        # Cancel logic
         def on_cancel(instance):
             password_popup.dismiss()
 
-        # Bind buttons
         confirm_button.bind(on_press=on_confirm)
         cancel_button.bind(on_press=on_cancel)
 
-        # Open the popup
         password_popup.open()
 
     def fetch_player_stats(self, player_name):
@@ -2741,9 +3469,8 @@ class SkillRatingApp(MDApp):
             if self.conn is None:
                 raise Exception("Database connection is not established.")
 
-
             cursor = self.conn.cursor()
-            cursor.execute('''
+            cursor.execute(''' 
                 SELECT 
                     total_matches,
                     kills AS total_kills,
@@ -2767,7 +3494,7 @@ class SkillRatingApp(MDApp):
                  last_updated_player_level, overall_win_ratio, red_team_win_rate,
                  blue_team_win_rate, kpg, fpg, xpg) = result
 
-                # Handle NULLs (just to be safe)
+                # Handle NULLs
                 matches = matches or 0
                 total_kills = total_kills or 0
                 total_flags = total_flags or 0
@@ -2781,29 +3508,45 @@ class SkillRatingApp(MDApp):
                 fpg = fpg or 0
                 xpg = xpg or 0
 
+                # Resolve tier badge (only top-right corner, no main layout)
+                tier_name, badge_filename = self.get_tier_and_badge(average_skill)
+                if badge_filename:
+                    badge_filename_gif = badge_filename.replace('.png', '.gif')
+                else:
+                    badge_filename_gif = 'default_badge.gif'  # fallback filename
 
+                badge_path = resource_find(f'badges/{badge_filename_gif}')
+                if not badge_path:
+                    badge_path = resource_path(f'badges/{badge_filename_gif}')
+                if not os.path.exists(badge_path):
+                    badge_path = resource_path('badges/default_badge.gif')  # final fallback
+
+                # Create the badge image
+                tier_badge_image = Image(
+                    source=badge_path or '',
+                    size_hint=(None, None),
+                    size=(150, 150),
+                )
 
                 # Resolve flag path
-                if country_flag:
-                    country_flag_path = resource_find(f'flags/{country_flag}')
-                    if not country_flag_path:
-                        country_flag_path = resource_find('flags/default.png')
-                else:
-                    country_flag_path = resource_find('flags/default.png')
+                flag_filename = self.get_flag_for_player(player_name) or country_flag
+                flag_path = resource_find(f'flags/{flag_filename}')
+                if not flag_path:
+                    flag_path = resource_path(f'flags/{flag_filename}')
+                if not os.path.exists(flag_path):
+                    flag_path = resource_path('flags/default.png')
 
-                if not country_flag_path:
-                    fallback_path = resource_path('flags/default.png')
-                    if os.path.exists(fallback_path):
-                        country_flag_path = fallback_path
-                    else:
-                        country_flag_path = None
-
-                # Instance variable for access in dropdown updates
+                # Enlarged flag size
                 self.flag_image = Image(
-                    source=country_flag_path if country_flag_path else '',
+                    source=flag_path or '',
                     size_hint=(None, None),
-                    size=(20, 20)
+                    size=(80, 50),  # Increased size for the flag
+                    allow_stretch=True,
+                    keep_ratio=True
                 )
+
+                flag_wrapper = BoxLayout(size_hint_y=None, height=60)
+
 
                 input_layout = GridLayout(cols=2, padding=10, spacing=12)
                 stats_message = [
@@ -2824,23 +3567,23 @@ class SkillRatingApp(MDApp):
                     input_layout.add_widget(Label(text=stat_name, size_hint_y=None, height=40))
                     input_layout.add_widget(Label(text=str(stat_value), size_hint_y=None, height=40))
 
-                # Add flag display
-                # Get flag from DB
-                flag_filename = self.get_flag_for_player(player_name) or "default.png"
+                # Create a FloatLayout to control the flag position
+                flag_float = FloatLayout(size_hint_y=None, height=60)
 
-                # Resolve actual file path
-                resolved_path = resource_find(f'flags/{flag_filename}')
-                if not resolved_path:
-                    resolved_path = resource_path(f'flags/{flag_filename}')
+                # Set flag image position inside the float layout
+                self.flag_image.size_hint = (None, None)
+                self.flag_image.size = (80, 50)
+                self.flag_image.pos_hint = {'x': 0.44, 'y': 0.1}  # Adjust x/y to position within the cell
 
-                # Create the image widget with the resolved flag
-                self.flag_image = Image(source=resolved_path or "flags/default.png", size_hint_y=None, height=100)
+                # Clear flag_wrapper and use FloatLayout
+                flag_float.add_widget(self.flag_image)
 
-                # Add label and image to layout
-                input_layout.add_widget(Label(text="Country Flag:", size_hint_y=None, height=40))
-                input_layout.add_widget(self.flag_image)
+                # Add to the input layout
+                input_layout.add_widget(Label(text="Country:", size_hint_y=None, height=40))
+                input_layout.add_widget(flag_float)
 
-                # Flag selection dropdown
+
+                # Flag dropdown
                 flag_dropdown = DropDown()
                 flags_dir = resource_path('flags')
                 self.flag_image_paths = []
@@ -2872,60 +3615,77 @@ class SkillRatingApp(MDApp):
                         else:
                             self.show_popup("Flag Error", "Could not load the updated flag image.")
 
-                    # Secure with admin password
                     self.ask_for_admin_password_for_flag_change(on_password_success)
 
-                # Create dropdown options with secured callback
-                flag_dropdown = DropDown()
+                for flag in self.flag_image_paths:
+                    flag_layout = BoxLayout(orientation='vertical', size_hint_y=None, height=80, padding=(5, 5))
+                    flag_image = HoverButton(
+                        size_hint=(None, None),
+                        size=(80, 50),  # Enlarged preview size for the flag
+                        background_normal=flag,
+                        background_down=flag,
+                        background_color=(1, 1, 1, 1)
 
-                if os.path.isdir(flags_dir):
-                    for flag in os.listdir(flags_dir):
-                        if flag.endswith('.png'):
-                            full_path = os.path.join(flags_dir, flag)
-
-                            # Create a layout for each flag (for spacing)
-                            flag_layout = BoxLayout(orientation='vertical', size_hint_y=None, height=60, padding=(5, 5))
-
-                            # Create the image (resized smaller)
-                            flag_image = HoverButton(
-                                size_hint=(None, None),
-                                size=(50, 30),
-                                background_normal=full_path,
-                                background_down=full_path,
-                                background_color=(1, 1, 1, 1)
-                            )
-
-                            # Add hover behavior if you want (optional glow)
-                            flag_image.bind(on_release=lambda btn, path=full_path: [
-                                self.ask_for_admin_password_for_flag_change(lambda: update_player_flag(path)),
-                                flag_dropdown.dismiss()
-                            ])
-
-                            flag_layout.add_widget(flag_image)
-
-                            flag_dropdown.add_widget(flag_layout)
+                    )
+                    flag_image.bind(on_release=lambda btn, path=flag: [
+                        self.ask_for_admin_password_for_flag_change(lambda: update_player_flag(path)),
+                        flag_dropdown.dismiss()
+                    ])
+                    flag_layout.add_widget(flag_image)
+                    flag_dropdown.add_widget(flag_layout)
 
                 current_flag_button.bind(on_release=flag_dropdown.open)
                 input_layout.add_widget(Label(text="Select Flag:", size_hint_y=None, height=40))
                 input_layout.add_widget(current_flag_button)
 
-                # OK and Cancel Buttons
+                # Buttons
                 button_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
-                ok_button = Button(text="OK", size_hint_x=0.5)
+
+                ok_button = Button(text="OK", size_hint_x=0.33)
                 ok_button.bind(on_press=lambda x: self.close_popup())
                 button_layout.add_widget(ok_button)
 
-                cancel_button = Button(text="Cancel", size_hint_x=0.5)
+                cancel_button = Button(text="Cancel", size_hint_x=0.33)
                 cancel_button.bind(on_press=lambda x: self.close_popup())
                 button_layout.add_widget(cancel_button)
 
-                # Compose popup
+                def refresh_stats(instance):
+                    try:
+                        import mysql.connector
+                        conn = mysql.connector.connect(
+                            host=DB_HOST,
+                            user=DB_USERNAME,
+                            password=DB_PASSWORD,
+                            database=DB_NAME,
+                            port=DB_PORT
+                        )
+                        self.conn = conn
+                        self.stats_popup.dismiss()
+                        self.fetch_player_stats(player_name)
+                    except Exception as e:
+                        self.show_popup("Refresh Error", str(e))
+
+                refresh_button = Button(text="Refresh", size_hint_x=0.34)
+                refresh_button.bind(on_press=refresh_stats)
+                button_layout.add_widget(refresh_button)
+
+                # Main layout for stats
                 main_layout = BoxLayout(orientation='vertical')
                 main_layout.add_widget(input_layout)
                 main_layout.add_widget(button_layout)
 
-                self.stats_popup = Popup(title="Player Stats", content=main_layout, size_hint=(1, 0.9))
+                # Create a layout for the badge at the top-right
+                badge_layout = BoxLayout(size_hint=(None, None), size=(50, 50), pos_hint={'right': 0.5, 'top': 0.92})
+                badge_layout.add_widget(tier_badge_image)
+
+                # Wrap both layouts together in a parent layout
+                parent_layout = FloatLayout()
+                parent_layout.add_widget(main_layout)
+                parent_layout.add_widget(badge_layout)
+
+                self.stats_popup = Popup(title="Player Stats", content=parent_layout, size_hint=(1, 0.9))
                 self.stats_popup.open()
+
             else:
                 self.show_popup("Player Not Rated", "The player is not rated yet.")
 
@@ -3034,15 +3794,32 @@ class SkillRatingApp(MDApp):
         spacer = Label(size_hint_y=None, height=15)
         layout.add_widget(spacer)
 
-        self.generate_inputs_button = Button(text='Generate Player Inputs', size_hint_y=None, height=40, opacity=0.8)
+        self.generate_inputs_button = Button(
+            text='Generate Player Inputs',
+            size_hint_y=None,
+            height=40,
+            opacity=0.8
+        )
         self.generate_inputs_button.bind(on_press=self.generate_player_input_fields)
         style_button(self.generate_inputs_button)
         layout.add_widget(self.generate_inputs_button)
 
-        self.player_inputs_layout = BoxLayout(orientation='vertical', size_hint_y=None)
-        self.player_inputs_layout.bind(minimum_height=self.player_inputs_layout.setter('height'))
+        self.player_inputs_layout = BoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            size_hint_x=1
+        )
+        self.player_inputs_layout.bind(
+            minimum_height=self.player_inputs_layout.setter('height')
+        )
 
-        scroll_view = ScrollView(size_hint=(1, None), size=(600, 400))
+        scroll_view = ScrollView(
+            size_hint=(1, None),
+            height=400,
+            bar_width=20,  # <---- This makes the scrollbar thicker
+            scroll_type=['bars', 'content'],
+            do_scroll_x=False
+        )
         scroll_view.add_widget(self.player_inputs_layout)
         layout.add_widget(scroll_view)
 
@@ -3112,7 +3889,9 @@ class SkillRatingApp(MDApp):
                 duration=15
             )
             self.main_layout.add_widget(moving_gif)
-
+            self.main_layout.remove_widget(self.achievement_label)
+            self.main_layout.remove_widget(self.seasons_button)
+            self.main_layout.remove_widget(self.stats_label)
             self.create_stats_layout()
 
         except Exception as e:
@@ -3156,6 +3935,13 @@ class SkillRatingApp(MDApp):
 
     def go_to_home(self, instance):
         # Clear the input layout of any player input fields
+
+        self.main_layout.add_widget(self.seasons_button)
+        self.main_layout.add_widget(self.stats_label)
+
+        if hasattr(self, 'achievement_label') and self.achievement_label not in self.main_layout.children:
+            self.main_layout.add_widget(self.achievement_label)
+
         if hasattr(self, 'player_inputs_layout'):
             self.player_inputs_layout.clear_widgets()
         if hasattr(self, 'players'):
@@ -3203,32 +3989,52 @@ class SkillRatingApp(MDApp):
         self.player_inputs_layout.add_widget(self.stats_layout)
 
     def display_player_stats(self, player_stats):
-        """Display each player's statistics in the stats layout."""
+        """Display each player's statistics in a nicely formatted table layout."""
 
         # Clear previous results
         self.stats_layout.clear_widgets()
 
+        # Create a new GridLayout with 7 columns (1 for each stat)
+        table = GridLayout(cols=7, spacing=5, size_hint_y=None)
+        table.bind(minimum_height=table.setter('height'))  # Make height dynamic
+
         # Add headers
-        headers = ['Player Name', 'Kills', 'Flags Captured', 'Level', 'XP', 'Skill Rating']
+        headers = ['Player Name', 'Kills', 'Flags Captured', 'Level', 'XP', 'Team', 'Skill Rating']
         for header in headers:
-            self.stats_layout.add_widget(Label(
+            table.add_widget(Label(
                 text=header,
                 size_hint_y=None,
                 height=40,
+                color=(0, 0, 0, 1),
                 bold=True,
-                halign='center'
+                font_size=16,
+                halign='center',
+                valign='middle'
             ))
 
-        # Populate the stats layout with player results
+        # Populate the table with player stats
         for name, stats in player_stats.items():
-            self.stats_layout.add_widget(Label(text=name, size_hint_y=None, height=30))  # Player Name
-            self.stats_layout.add_widget(Label(text=str(stats['kills']), size_hint_y=None, height=30))  # Kills
-            self.stats_layout.add_widget(
-                Label(text=str(stats['flags_captured']), size_hint_y=None, height=30))  # Flags Captured
-            self.stats_layout.add_widget(Label(text=str(stats['level']), size_hint_y=None, height=30))  # Level
-            self.stats_layout.add_widget(Label(text=str(stats['xp']), size_hint_y=None, height=30))  # XP
-            self.stats_layout.add_widget(
-                Label(text=f"{stats['skill_rating']:.2f}", size_hint_y=None, height=30))  # Skill Rating
+            row = [
+                name,
+                str(stats['kills']),
+                str(stats['flags_captured']),
+                str(stats['level']),
+                str(stats['xp']),
+                str(stats['final_team']),
+                f"{stats['rating_delta']:.2f}"
+            ]
+            for value in row:
+                table.add_widget(Label(
+                    text=value,
+                    size_hint_y=None,
+                    height=30,
+                    color=(0, 0, 0, 1),
+                    halign='center',
+                    valign='middle'
+                ))
+
+        # Add the table to the main stats layout
+        self.stats_layout.add_widget(table)
 
     def display_match_results(self, team_stats):
         red_team_flags = team_stats['Red']['flags']
@@ -3269,6 +4075,7 @@ class SkillRatingApp(MDApp):
         player_name_box.add_widget(player_label)
 
         name_input = TextInput(hint_text="Player Name", size_hint_x=0.6)
+        name_input.text = player_identifier  # player_identifier is now the real name
         player_name_box.add_widget(name_input)
 
         dropdown_button = Button(
@@ -3390,14 +4197,17 @@ class SkillRatingApp(MDApp):
             'team': team_name,
             'name_getter': lambda: name_input.text.strip(),
             'inputs': field_inputs + dynamic_rows,
-            'has_switched': False
+            'has_switched': False,
+            'player_box': player_box,
         })
 
         self.player_inputs_layout.add_widget(player_box)
 
-    def calculate_skill_rating_logic(self, player, outcome, teammates_avg_rating, opponents_avg_rating,
-                                     teammates_avg_level, opponents_avg_level, switched=False):
-        # Clamp level at 239 for rating effect
+    def calculate_skill_rating_logic(
+            self, player, outcome, teammates_avg_rating, opponents_avg_rating,
+            teammates_avg_level, opponents_avg_level, switched=False
+    ):
+        global performance_score
         max_level = 239
         try:
             level = int(player.level)
@@ -3405,36 +4215,40 @@ class SkillRatingApp(MDApp):
             level = 0
         level = min(level, max_level)
 
-        # Weights for performance metrics
-        kills_weight = 0.3
-        flags_weight = 0.5
-        xp_weight = 0.2
+        # XP normalization for winners
+        normalized_xp = player.xp
+        if outcome == 'win':
+            normalized_xp = player.xp / 2
 
-        # Normalize time played (assume 8 minutes = 480 seconds)
+        kills_weight = 0.3
+        flags_weight = 0.7
+        xp_weight = 0.2
+        xp_divisor = 10000
+
         if player.time_played and player.time_played > 0:
-            time_factor = 480 / (60 * player.time_played)
+            time_factor = min(8 / player.time_played, 2)
         else:
             time_factor = 0
-            performance_score = -5  # Heavy penalty for no playtime
+            performance_score = -5
+
         if time_factor > 0:
             performance_score = (
                     (flags_weight * player.flags_captured +
                      kills_weight * player.kills +
-                     (xp_weight * player.xp) / 10000) * time_factor
+                     (xp_weight * normalized_xp) / xp_divisor) * time_factor
             )
 
-        # Outcome adjustments with switched player considerations
         if outcome == 'win':
-            outcome_bonus = 0.5 if not switched else 0.7  # Switched player rewarded more on win
+            outcome_bonus = 0.7 if not switched else 0.9
         elif outcome == 'lose':
-            outcome_bonus = -0.25 if not switched else -0.1  # Switched player penalized less on loss
+            outcome_bonus = -0.5 if not switched else -0.2
         elif outcome == 'draw':
             outcome_bonus = 0
         else:
             outcome_bonus = 0
 
-        skill_rating = float(player.skill_rating or 0)
-        skill_rating += performance_score + outcome_bonus
+        # Calculate rating delta (change from this match)
+        rating_delta = performance_score + outcome_bonus
 
         # Weighted average benchmark for fairness
         try:
@@ -3449,41 +4263,53 @@ class SkillRatingApp(MDApp):
         opponents_weight = 0.2
 
         weighted_avg_rating = (
-                skill_rating * player_weight +
+                (player.skill_rating or 0) * player_weight +
                 teammates_avg * teammates_weight +
                 opponents_avg * opponents_weight
         )
 
-        # Bonus or penalty based on comparison to weighted average
-        if skill_rating > weighted_avg_rating:
-            skill_rating += 0.5
-        elif skill_rating < weighted_avg_rating:
-            skill_rating -= 0.5
+        # Adjust delta based on relative performance
+        # Compare (current rating + rating_delta) with weighted average
+        post_match_rating = (player.skill_rating or 0) + rating_delta
 
-        # Level influence (small negative weight to balance)
+        if post_match_rating > weighted_avg_rating:
+            rating_delta += 1
+        elif post_match_rating < weighted_avg_rating:
+            rating_delta -= 1
+
+        # Level influence
         normalized_level = level / max_level
-        level_weight = -0.8
-        skill_rating += normalized_level * level_weight
+        level_weight = -0.5
+        rating_delta += normalized_level * level_weight
 
-        # Level gap influence between teams (capped)
+        # Level gap influence
         try:
             level_gap = teammates_avg_level - opponents_avg_level
         except (TypeError, ValueError):
             level_gap = 0
-        clamped_gap = max(min(level_gap, 50), -50)
-        level_gap_modifier = -(clamped_gap / 10) * 0.1  # Negative gap is a bonus
-        skill_rating += level_gap_modifier
+        clamped_gap = max(min(level_gap, 120), -120)
+        level_gap_modifier = -(clamped_gap / 10) * 0.1
+        rating_delta += level_gap_modifier
 
-        # Soft cap: diminishing returns above 200 rating
-        if skill_rating > 200:
-            skill_rating = 200 + (skill_rating - 200) * 0.5
+        # Clamp rating_delta to max 15
+        rating_delta = min(rating_delta, 15)
+        # Soft cap on rating delta is optional, usually applies on total rating
+        # But if you want, you can limit the delta here (e.g., max +5 or -5 per match)
+        print(rating_delta, 'line 4184')
+        # Return the rating delta (change) without scaling down
+        return round(rating_delta, 4)
 
-        print(skill_rating , "line 3280")
 
-        return round(skill_rating / 100, 2)
-        print(skill_rating, "line 3283")
+
 
     def calculate_skill_rating(self, instance):
+        """
+        Calculate skill rating deltas (changes) for all players in the match,
+        considering dynamic segments (switched teams), final teams,
+        and aggregate weighted rating deltas by time played.
+        """
+
+
         player_stats = {}
         all_players = set()
         team_stats = {'Red': {'kills': 0, 'flags': 0}, 'Blue': {'kills': 0, 'flags': 0}}
@@ -3508,12 +4334,11 @@ class SkillRatingApp(MDApp):
             self.show_popup("Warning", "\n".join(empty_fields))
             return
 
-        # Parse each player
+        # Parse player stats including dynamic segments
         for player in self.players:
             name = player['name_getter']()
             final_team = player['team']
 
-            # Parse standard inputs (final segment)
             try:
                 kills_final = int(player['inputs'][0].text or 0)
                 flags_final = int(player['inputs'][1].text or 0)
@@ -3526,7 +4351,6 @@ class SkillRatingApp(MDApp):
                 self.show_popup("Input Error", f"Invalid input for player '{name}'. Please enter valid numbers.")
                 return
 
-            # Parse dynamic rows (original segment)
             dynamic_inputs = player['inputs'][6:]
             kills_dynamic = 0
             flags_dynamic = 0
@@ -3555,22 +4379,18 @@ class SkillRatingApp(MDApp):
                 except Exception:
                     continue
 
-            # Assign dynamic stats to opposing team if switched
             if has_switch:
                 dynamic_team = 'Red' if final_team == 'Blue' else 'Blue'
             else:
                 dynamic_team = final_team
 
-            # XP split proportional to time played
             total_time = time_dynamic + time_final
-            if total_time > 0:
-                xp_dynamic = int(xp_total * (time_dynamic / total_time))
-                xp_final = xp_total - xp_dynamic
+            if time_final > 0:
+                xp_dynamic = int((xp_total / time_final) * time_dynamic)
             else:
                 xp_dynamic = 0
-                xp_final = xp_total
+            xp_final = xp_total
 
-            # Aggregate team stats for win calculation
             team_stats[dynamic_team]['kills'] += kills_dynamic
             team_stats[dynamic_team]['flags'] += flags_dynamic
             team_levels[dynamic_team].append(level)
@@ -3579,7 +4399,6 @@ class SkillRatingApp(MDApp):
             team_stats[final_team]['flags'] += flags_final
             team_levels[final_team].append(level)
 
-            # Store player stats for rating and display
             total_kills = kills_dynamic + kills_final
             total_flags = flags_dynamic + flags_final
             skill_rating = self.fetch_player_rating(name)
@@ -3622,15 +4441,12 @@ class SkillRatingApp(MDApp):
             else:
                 winning_team = "Draw"
 
-        # Prepare ratings lists
         red_ratings = [self.fetch_player_rating(p['name_getter']()) for p in self.players if p['team'] == 'Red']
         blue_ratings = [self.fetch_player_rating(p['name_getter']()) for p in self.players if p['team'] == 'Blue']
 
-        # Calculate skill rating for each player segment
         for name, stats in player_stats.items():
-            ratings = []
+            rating_deltas = []
 
-            # Dynamic segment (original team)
             if stats['time_dynamic'] > 0:
                 outcome_dynamic = 'draw' if winning_team == 'Draw' else (
                     'win' if stats['dynamic_team'] == winning_team else 'lose')
@@ -3658,7 +4474,7 @@ class SkillRatingApp(MDApp):
                     stats['skill_rating']
                 )
 
-                rating_dynamic = self.calculate_skill_rating_logic(
+                delta_dynamic = self.calculate_skill_rating_logic(
                     player_instance_dynamic,
                     outcome_dynamic,
                     avg_teammate_rating_dynamic,
@@ -3667,9 +4483,8 @@ class SkillRatingApp(MDApp):
                     avg_opponent_level_dynamic,
                     switched=True
                 )
-                ratings.append((rating_dynamic, stats['time_dynamic']))
+                rating_deltas.append((delta_dynamic, stats['time_dynamic']))
 
-            # Final segment (final team)
             if stats['time_final'] > 0:
                 outcome_final = 'draw' if winning_team == 'Draw' else (
                     'win' if stats['final_team'] == winning_team else 'lose')
@@ -3694,7 +4509,7 @@ class SkillRatingApp(MDApp):
                     stats['skill_rating']
                 )
 
-                rating_final = self.calculate_skill_rating_logic(
+                delta_final = self.calculate_skill_rating_logic(
                     player_instance_final,
                     outcome_final,
                     avg_teammate_rating_final,
@@ -3703,33 +4518,30 @@ class SkillRatingApp(MDApp):
                     avg_opponent_level_final,
                     switched=False
                 )
-                ratings.append((rating_final, stats['time_final']))
+                rating_deltas.append((delta_final, stats['time_final']))
 
-            # Weighted average of both segments by time played
-            if ratings:
-                total_time = sum(t for _, t in ratings)
-                weighted_rating = sum(r * t for r, t in ratings) / total_time if total_time > 0 else stats[
-                    'skill_rating']
+            # Weighted sum of rating deltas by time played
+            if rating_deltas:
+                total_time = sum(t for _, t in rating_deltas)
+                weighted_delta = sum(delta * t for delta, t in rating_deltas) / total_time if total_time > 0 else 0
             else:
-                weighted_rating = stats['skill_rating']
+                weighted_delta = 0
 
+            # Store the rating delta (total rating change from this match) here
+            stats['rating_delta'] = weighted_delta
 
-            print(stats['skill_rating'] , "line 3516")
+            # Optionally keep old rating unchanged for now
+            stats['skill_rating'] = stats['skill_rating']  # unchanged
 
-            tier = get_tier(int(weighted_rating))
-            stats['skill_rating'] = weighted_rating
-            stats['tier'] = tier
-            stats['outcome'] = 'win' if winning_team != 'Draw' and stats[
-                'final_team'] == winning_team else 'lose' if winning_team != 'Draw' else 'draw'
+            stats['outcome'] = 'win' if winning_team != 'Draw' and stats['final_team'] == winning_team else \
+                'lose' if winning_team != 'Draw' else 'draw'
 
-        # Display results
+        # Update UI or database as needed
         self.display_player_stats(player_stats)
         self.display_match_results(team_stats)
 
         self.submit_button.disabled = False
-
         self.export_button.disabled = False
-
         self.player_stats = player_stats
 
     def player_exists_in_database(self, player_name):
@@ -3737,26 +4549,38 @@ class SkillRatingApp(MDApp):
         cursor.execute("SELECT COUNT(*) FROM overall_player_skill_rating WHERE player_name = %s", (player_name,))
         return cursor.fetchone()[0] > 0
 
-
     def confirm_create_players(self, player_names):
-        content = BoxLayout(orientation='vertical')
-        warning_text = "The following players do not exist:\n" + "\n".join(
-            player_names) + "\nWould you like to create them?"
-        content.add_widget(Label(text=warning_text))
+        content = BoxLayout(orientation='vertical', spacing=10, padding=10)
 
-        yes_button = Button(text="Yes", size_hint=(0.3, 0.3))
+        # Scrollable label for long player list
+        scroll_view = ScrollView(size_hint=(1, 1))
+        inner_layout = GridLayout(cols=1, size_hint_y=None)
+        inner_layout.bind(minimum_height=inner_layout.setter('height'))
+
+        warning_lines = ["The following players do not exist:"] + player_names + ["", "Would you like to create them?"]
+        for line in warning_lines:
+            inner_layout.add_widget(Label(text=line, size_hint_y=None, height=30))
+
+        scroll_view.add_widget(inner_layout)
+        content.add_widget(scroll_view)
+
+        # Buttons
+        btn_layout = BoxLayout(size_hint_y=None, height=50, spacing=10, padding=[0, 10])
+        yes_button = Button(text="Yes")
+        no_button = Button(text="No")
+
+        # Will bind after popup is defined
+        btn_layout.add_widget(yes_button)
+        btn_layout.add_widget(no_button)
+        content.add_widget(btn_layout)
+
+        # Popup definition
+        popup = Popup(title="Player Creation Confirmation", content=content, size_hint=(0.6, 0.6))
+
+        # Bind buttons
         yes_button.bind(on_release=lambda x: [self.create_new_players(player_names), popup.dismiss()])
-
-        no_button = Button(text="No", size_hint=(0.3, 0.3))
         no_button.bind(on_release=lambda x: popup.dismiss())
 
-        popup_layout = BoxLayout(orientation='horizontal')
-        popup_layout.add_widget(yes_button)
-        popup_layout.add_widget(no_button)
-
-        content.add_widget(popup_layout)
-
-        popup = Popup(title="Player Creation Confirmation", content=content, size_hint=(0.6, 0.6))
         popup.open()
 
     def create_new_players(self, player_names):
@@ -3911,6 +4735,8 @@ class SkillRatingApp(MDApp):
             self.show_popup("Error", f"Export failed: {str(e)}")
             self.submit_button.disabled = False
 
+
+
     def create_players_and_continue_export(self, new_players):
         try:
             cursor = self.conn.cursor()
@@ -3972,7 +4798,8 @@ class SkillRatingApp(MDApp):
             print(f"[DEBUG] Fetching existing player stats from 'overall_player_skill_rating'...")
             format_strings = ','.join(['%s'] * len(player_names))
             cursor.execute(f'''
-                SELECT player_name, total_matches, overall_win_ratio, red_team_win_rate, blue_team_win_rate
+                SELECT player_name, total_matches, overall_win_ratio, red_team_win_rate, blue_team_win_rate,
+                       kills, flags_captured, xp
                 FROM overall_player_skill_rating
                 WHERE player_name IN ({format_strings})
             ''', tuple(player_names))
@@ -3982,7 +4809,10 @@ class SkillRatingApp(MDApp):
                     'total_matches': row[1] or 0,
                     'overall_win_ratio': row[2] or 0.0,
                     'red_team_win_rate': row[3] or 0.0,
-                    'blue_team_win_rate': row[4] or 0.0
+                    'blue_team_win_rate': row[4] or 0.0,
+                    'kills': row[5] or 0,
+                    'flags_captured': row[6] or 0,
+                    'xp': row[7] or 0
                 }
                 for row in cursor.fetchall()
             }
@@ -3990,20 +4820,19 @@ class SkillRatingApp(MDApp):
             print(f"[DEBUG] Existing stats fetched: {existing_stats}")
 
             for name, stats in self.player_stats.items():
-                print(f"\n[DEBUG] Processing player: {name}")
                 kills = stats['kills']
                 flags = stats['flags_captured']
                 level = stats['level']
-                time_played = stats['time_played']
                 xp = stats['xp']
-                skill_rating = stats['skill_rating']
                 final_team = stats['final_team']
                 outcome = stats['outcome']
+                delta_skill_rating = stats.get('rating_delta', 0)
 
                 print(f"[DEBUG] Inserting/updating player: {name}, "
-                      f"Kills: {kills}, Flags: {flags}, XP: {xp}, Level: {level}, "
-                      f"Skill Rating: {skill_rating:.2f}, Final Team: {final_team}, Outcome: {outcome}")
+                      f"Kills: {kills}, Flags: {flags}, XP: {xp}, "
+                      f"Delta Skill Rating: {delta_skill_rating:.3f}, Final Team: {final_team}, Outcome: {outcome}")
 
+                # Insert delta skill rating into player_skill_rating table
                 cursor.execute('''
                     INSERT INTO player_skill_rating 
                     (player_name, kills, flags_captured, xp, skill_rating, match_number, player_level, final_team, outcome)
@@ -4016,14 +4845,17 @@ class SkillRatingApp(MDApp):
                         player_level = VALUES(player_level),
                         final_team = VALUES(final_team),
                         outcome = VALUES(outcome)
-                ''', (name, kills, flags, xp, skill_rating, self.match_number, level, final_team, outcome))
-                print("[DEBUG] Inserted into player_skill_rating")
+                ''', (name, kills, flags, xp, delta_skill_rating, self.match_number, level, final_team, outcome))
+                print("[DEBUG] Inserted delta skill rating into player_skill_rating")
 
                 prev_stats = existing_stats.get(name, {
                     'total_matches': 0,
                     'overall_win_ratio': 0.0,
                     'red_team_win_rate': 0.0,
-                    'blue_team_win_rate': 0.0
+                    'blue_team_win_rate': 0.0,
+                    'kills': 0,
+                    'flags_captured': 0,
+                    'xp': 0
                 })
 
                 old_total_matches = prev_stats['total_matches']
@@ -4040,16 +4872,23 @@ class SkillRatingApp(MDApp):
                 new_red_team_win_rate = (new_red_wins / new_total_matches) * 100
                 new_blue_team_win_rate = (new_blue_wins / new_total_matches) * 100
 
-                print(f"[DEBUG] Updated win ratios for {name}: "
-                      f"Total Matches: {new_total_matches}, "
-                      f"Overall Win Ratio: {new_overall_win_ratio:.2f}%, "
-                      f"Red Win Rate: {new_red_team_win_rate:.2f}%, "
-                      f"Blue Win Rate: {new_blue_team_win_rate:.2f}%")
+                total_kills = prev_stats['kills'] + kills
+                total_flags = prev_stats['flags_captured'] + flags
+                total_xp = prev_stats['xp'] + xp
+
+                new_kpg = int(total_kills / new_total_matches)
+                new_fpg = int(total_flags / new_total_matches)
+                new_xpg = int(total_xp / new_total_matches)
+
+                print(f"[DEBUG] Updated win ratios and averages for {name}: "
+                      f"KPG: {new_kpg}, FPG: {new_fpg}, XPG: {new_xpg}")
 
                 cursor.execute('''
                     INSERT INTO overall_player_skill_rating 
-                    (player_name, kills, flags_captured, xp, final_skill_rating, total_matches, red_team_win_rate, blue_team_win_rate, overall_win_ratio, last_updated_player_level)
-                    VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s)
+                    (player_name, kills, flags_captured, xp, final_skill_rating, total_matches, 
+                     red_team_win_rate, blue_team_win_rate, overall_win_ratio, last_updated_player_level,
+                     KPG, FPG, XPG)
+                    VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         kills = kills + VALUES(kills),
                         flags_captured = flags_captured + VALUES(flags_captured),
@@ -4058,17 +4897,22 @@ class SkillRatingApp(MDApp):
                         red_team_win_rate = VALUES(red_team_win_rate),
                         blue_team_win_rate = VALUES(blue_team_win_rate),
                         overall_win_ratio = VALUES(overall_win_ratio),
-                        final_skill_rating = final_skill_rating + VALUES(final_skill_rating),
-                        last_updated_player_level = VALUES(last_updated_player_level)
+                        final_skill_rating = (final_skill_rating * (total_matches - 1) + VALUES(final_skill_rating)) / total_matches,
+                        last_updated_player_level = VALUES(last_updated_player_level),
+                        KPG = VALUES(KPG),
+                        FPG = VALUES(FPG),
+                        XPG = VALUES(XPG)
                 ''', (
-                    name, kills, flags, xp, skill_rating,
-                    new_red_team_win_rate, new_blue_team_win_rate, new_overall_win_ratio, level
+                    name, kills, flags, xp, delta_skill_rating,
+                    new_red_team_win_rate, new_blue_team_win_rate, new_overall_win_ratio, level,
+                    new_kpg, new_fpg, new_xpg
                 ))
-                print("[DEBUG] Updated overall_player_skill_rating")
+                print("[DEBUG] Updated overall_player_skill_rating with new values")
 
             self.conn.commit()
             print("[DEBUG] Export committed successfully.")
             self.show_popup("Success", "Data exported successfully!")
+            self.export_button.disabled = True
 
         except Exception as e:
             print(f"[ERROR] Exception occurred: {e}")
@@ -4107,7 +4951,7 @@ class SkillRatingApp(MDApp):
                         SELECT player_name, total_matches, XPG, KPG, FPG, final_skill_rating,
                                overall_win_ratio, last_updated_player_level
                         FROM overall_player_skill_rating
-                        ORDER BY XPG DESC
+                        ORDER BY overall_win_ratio DESC
                     '''
                     headers = ['Player', 'Matches', 'XP/Game', 'Kills/Game', 'Flags/Game',
                                'Skill Rating', 'Win Ratio (%)', 'Last Level']
@@ -4219,194 +5063,563 @@ class SkillRatingApp(MDApp):
 
         return ''  # Nothing found
 
-    def show_leaderboard(self, instance):
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT
-                    player_name,
-                    total_matches,
-                    kills,
-                    flags_captured,
-                    final_skill_rating,
-                    overall_win_ratio,
-                    last_updated_player_level,
-                    country_flag
-                FROM overall_player_skill_rating
-                ORDER BY final_skill_rating DESC
-            ''')
-            results = cursor.fetchall()
+    def get_tier_and_badge(self, final_skill_rating):
+        for tier in TIER_DEFINITIONS:
+            if tier['max'] is None:  # No upper limit
+                if final_skill_rating >= tier['min']:
+                    return tier['name'], tier['badge']
+            else:
+                if tier['min'] <= final_skill_rating < tier['max']:
+                    return tier['name'], tier['badge']
+        return "Unranked", None
 
-            leaderboard_content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+    def show_statistical_leaderboard(self, instance=None, sort_field='overall_win_ratio'):
+        if hasattr(self, 'leaderboard_popup') and self.leaderboard_popup:
+            self.leaderboard_popup.dismiss()
 
-            scroll_view = ScrollView(size_hint=(1, None), size=(700, 400))
+        leaderboard_content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        scroll_view = ScrollView(size_hint=(1, None), size=(900, 400))
 
-            leaderboard_grid = GridLayout(cols=9, padding=10, spacing=10, size_hint_y=None)
-            leaderboard_grid.bind(minimum_height=leaderboard_grid.setter('height'))
-
-            headers = [
-                'Rank', 'Player Name', 'Matches', 'Total Kills',
-                'Total Flags', 'Skill Rating', 'Win Ratio', 'Last updated level', 'Country Flag'
-            ]
-            for header in headers:
-                leaderboard_grid.add_widget(Label(
-                    text=header,
-                    size_hint_y=None,
-                    height=40,
-                    bold=True
-                ))
-
-            for idx, row in enumerate(results):
-                leaderboard_grid.add_widget(Label(text=str(idx + 1), size_hint_y=None, height=40))
-
-                player_name = row[0]
-                truncated_name = (player_name[:15] + '...') if len(player_name) > 15 else player_name
-                leaderboard_grid.add_widget(Label(text=truncated_name, size_hint_y=None, height=40))
-
-                leaderboard_grid.add_widget(Label(text=str(row[1]), size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(row[2]), size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(row[3]), size_hint_y=None, height=40))
-
-                # Skill Rating with yellow background
-                skill_box = BoxLayout(size_hint=(1, None), height=40, padding=5)
-
-                with skill_box.canvas.before:
-                    Color(1, 1, 0, 0.3)
-                    rect = Rectangle(size=skill_box.size, pos=skill_box.pos)
-
-                def update_rect(instance, value, rect=rect):
-                    rect.size = instance.size
-                    rect.pos = instance.pos
-
-                skill_box.bind(size=update_rect, pos=update_rect)
-
-                skill_label = Label(
-                    text=f"{row[4]:.2f}",
-                    bold=True,
-                    font_size=16,
-                    color=(0, 0, 0, 1)
+        def load_leaderboard_data(*args):
+            try:
+                # Always create a new DB connection for fresh data
+                conn = mysql.connector.connect(
+                    host=DB_HOST,
+                    user=DB_USERNAME,
+                    password=DB_PASSWORD,
+                    database=DB_NAME,
+                    port=DB_PORT
                 )
-                skill_box.add_widget(skill_label)
-                leaderboard_grid.add_widget(skill_box)
+                cursor = conn.cursor()
+                query = f'''
+                    SELECT
+                        player_name, total_matches, xp, KPG, FPG, final_skill_rating,
+                        overall_win_ratio, last_updated_player_level, country_flag, XPG, red_team_win_rate, blue_team_win_rate
+                    FROM overall_player_skill_rating
+                    ORDER BY {sort_field} DESC
+                '''
+                print("Executing SQL Query:", query)
+                cursor.execute(query)
+                results = cursor.fetchall()
+                print("Fetched Results:", results)
+                conn.close()
 
-                leaderboard_grid.add_widget(Label(text=f"{row[5]:.2f}%", size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(row[6]), size_hint_y=None, height=40))
+                scroll_view.clear_widgets()
 
-                # Country Flag with fallback
-                country_flag = row[7]
-                country_flag_path = self.get_flag_path(country_flag)
+                leaderboard_grid = GridLayout(cols=12, padding=10, spacing=10, size_hint_y=None)
+                leaderboard_grid.bind(minimum_height=leaderboard_grid.setter('height'))
 
-                flag_container = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+                headers = [
+                    '', 'Rank', 'Player Name', 'Matches', 'XPG', 'KPG',
+                    'FPG', 'Win%', 'Red Win%', 'Blue Win%', 'Flag', 'Level'
+                ]
+                for header in headers:
+                    leaderboard_grid.add_widget(Label(text=header, size_hint_y=None, height=40, bold=True))
 
-                spacer = Widget(size_hint_x=None, width=32)
-                flag_image = Image(source=country_flag_path, size_hint=(None, None), size=(30, 30))
+                for idx, row in enumerate(results):
+                    (player_name, matches, xp, kpg, fpg, rating, win_ratio,
+                     level, flag, xpg, red_win_rate, blue_win_rate) = row
 
-                flag_container.add_widget(spacer)
-                flag_container.add_widget(flag_image)
+                    # Badge based on skill rating
+                    tier, badge_filename = self.get_tier_and_badge(rating)
+                    if badge_filename:
+                        badge_path = resource_path(os.path.join("badges", badge_filename))
+                        badge_img = Image(source=badge_path, size_hint=(None, None), size=(40, 40))
+                    else:
+                        badge_img = Widget(size_hint=(None, None), size=(40, 40))
+                    leaderboard_grid.add_widget(badge_img)
 
-                leaderboard_grid.add_widget(flag_container)
+                    leaderboard_grid.add_widget(Label(text=str(idx + 1), size_hint_y=None, height=40))
 
-            scroll_view.add_widget(leaderboard_grid)
+                    truncated_name = (player_name[:15] + '...') if len(player_name) > 15 else player_name
+                    leaderboard_grid.add_widget(Label(text=truncated_name, size_hint_y=None, height=40))
+
+                    leaderboard_grid.add_widget(Label(text=str(matches), size_hint_y=None, height=40))
+                    leaderboard_grid.add_widget(Label(text=str(xpg), size_hint_y=None, height=40))
+                    leaderboard_grid.add_widget(Label(text=str(kpg), size_hint_y=None, height=40))
+                    leaderboard_grid.add_widget(Label(text=str(fpg), size_hint_y=None, height=40))
+                    leaderboard_grid.add_widget(Label(text=f"{win_ratio:.2f}%", size_hint_y=None, height=40))
+                    leaderboard_grid.add_widget(Label(text=f"{red_win_rate:.2f}%", size_hint_y=None, height=40))
+                    leaderboard_grid.add_widget(Label(text=f"{blue_win_rate:.2f}%", size_hint_y=None, height=40))
+
+                    # Flag image
+                    flag_path = self.get_flag_path(flag)
+                    flag_container = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+                    spacer = Widget(size_hint_x=None, width=32)
+                    flag_image = Image(source=flag_path, size_hint=(None, None), size=(30, 30))
+                    flag_container.add_widget(spacer)
+                    flag_container.add_widget(flag_image)
+                    leaderboard_grid.add_widget(flag_container)
+
+                    # Level
+                    leaderboard_grid.add_widget(Label(text=str(level), size_hint_y=None, height=40))
+
+                scroll_view.add_widget(leaderboard_grid)
+
+            except mysql.connector.Error as err:
+                print(f"Error occurred: {err}")
+                self.show_popup("Database Error", str(err))
+
+        # Dropdown to select sort field
+        sort_spinner = Spinner(
+            text='Sort by XP/Game',
+            values=('XPG', 'KPG', 'FPG', 'final_skill_rating', 'overall_win_ratio'),
+            size_hint=(None, None),
+            size=(200, 40)
+        )
+
+        sort_spinner.bind(text=partial(self._on_stat_sort_change, sort_spinner=sort_spinner))
+
+        leaderboard_content.add_widget(sort_spinner)
+
+        refresh_button = Button(text='Refresh', size_hint=(None, None), size=(100, 40))
+
+        def on_refresh(instance):
+            load_leaderboard_data()
+            self.show_popup("Info", "Leaderboard updated successfully.")
+
+        refresh_button.bind(on_press=on_refresh)
+        leaderboard_content.add_widget(refresh_button)
+
+        leaderboard_content.add_widget(scroll_view)
+
+        load_leaderboard_data()
+
+        close_button = Button(text='Close', size_hint=(None, None), size=(100, 40), pos_hint={'center_x': 0.5})
+        leaderboard_content.add_widget(close_button)
+
+        self.leaderboard_popup = Popup(
+            title='Statistical Leaderboard',
+            content=leaderboard_content,
+            size_hint=(1, 0.85)
+        )
+        close_button.bind(on_press=self.leaderboard_popup.dismiss)
+        self.leaderboard_popup.open()
+
+    import re
+    from kivy.uix.anchorlayout import AnchorLayout
+
+    def show_season_selector(self, instance):
+        try:
+            conn = mysql.connector.connect(
+                host=DB_HOST,
+                user=DB_USERNAME,
+                password=DB_PASSWORD,
+                database=DB_NAME,
+                port=DB_PORT
+            )
+            cursor = conn.cursor()
+            cursor.execute("SHOW TABLES LIKE 'Player_skill_rating_season_%'")
+            all_tables = [table[0] for table in cursor.fetchall()]
+            conn.close()
+
+            def extract_season_number(table_name):
+                match = re.search(r'season_(\d+)', table_name)
+                return int(match.group(1)) if match else float('inf')
+
+            season_tables = sorted(
+                [t for t in all_tables if t.startswith("Player_skill_rating_season_")],
+                key=extract_season_number
+            )
+
+            if not season_tables:
+                self.show_popup("No Seasons", "No seasonal leaderboards found.")
+                return
+
+            # Outer content layout
+            content_layout = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+            # ScrollView for season buttons
+            scroll = ScrollView(
+                size_hint=(1, 1),
+                bar_width=10,
+                scroll_type=['bars', 'content']
+            )
+            season_list = BoxLayout(
+                orientation='vertical',
+                size_hint_y=None,
+                spacing=10,
+                padding=[0, 0, 10, 0]
+            )
+            season_list.bind(minimum_height=season_list.setter('height'))
+
+            # Function to bind leaderboard open actions
+            def create_leaderboard_popup(table_name, season_label):
+                def open_leaderboard(*args):
+                    self.show_leaderboard_for_season(table_name, season_label)
+
+                return open_leaderboard
+
+            # Create and add buttons
+            for table in season_tables:
+                season_label = table.replace("Player_skill_rating_", "").replace("_", " ").title()
+                btn = Button(
+                    text=season_label,
+                    size_hint=(1, None),
+                    height=60,
+                    font_size=18,
+                    background_normal='',
+                    background_color=(0.2, 0.4, 0.6, 1),
+                    color=(1, 1, 1, 1)
+                )
+                btn.bind(on_press=create_leaderboard_popup(table, season_label))
+                season_list.add_widget(btn)
+
+            scroll.add_widget(season_list)
+            content_layout.add_widget(scroll)
+
+            # Close button
+            close_btn = Button(
+                text='Close',
+                size_hint=(1, None),
+                height=40,
+                font_size=16
+            )
+            close_btn.bind(on_press=lambda *args: season_popup.dismiss())
+            content_layout.add_widget(close_btn)
+
+            # Popup creation
+            season_popup = Popup(
+                title='Select a Season',
+                content=content_layout,
+                size_hint=(0.6, 0.8),
+                auto_dismiss=False
+            )
+            season_popup.open()
+
+        except mysql.connector.Error as err:
+            print(f"Error: {err}")
+            self.show_popup("Database Error", str(err))
+
+    def show_leaderboard_for_season(self, table_name, popup_title):
+        try:
+            leaderboard_content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+            scroll_view = ScrollView(size_hint=(1, None), size=(900, 400))
+            self.refresh_popup = None
+
+            def show_popup(title, message):
+                if self.refresh_popup and self.refresh_popup.parent:
+                    return
+                content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+                content.add_widget(Label(text=message))
+                btn = Button(text='OK', size_hint=(None, None), size=(100, 40), pos_hint={'center_x': 0.5})
+                content.add_widget(btn)
+                popup = Popup(title=title, content=content, size_hint=(0.6, 0.4))
+                btn.bind(on_press=popup.dismiss)
+                popup.bind(on_dismiss=lambda x: setattr(self, 'refresh_popup', None))
+                popup.open()
+                self.refresh_popup = popup
+                Clock.schedule_once(lambda dt: popup.dismiss(), 1.5)
+
+            def load_leaderboard_data(*args):
+                try:
+                    conn = mysql.connector.connect(
+                        host=DB_HOST,
+                        user=DB_USERNAME,
+                        password=DB_PASSWORD,
+                        database=DB_NAME,
+                        port=DB_PORT
+                    )
+                    cursor = conn.cursor()
+
+                    # Step 1: Fetch all players
+                    cursor.execute(f'''
+                        SELECT
+                            player_name,
+                            total_matches,
+                            kills,
+                            flags_captured,
+                            final_skill_rating,
+                            overall_win_ratio,
+                            last_updated_player_level,
+                            country_flag
+                        FROM {table_name}
+                    ''')
+                    results = cursor.fetchall()
+                    conn.close()
+
+                    if not results:
+                        show_popup("No data", "No players found for this season.")
+                        return
+
+                    # Step 2: Compute max total matches
+                    max_total_matches = max(row[1] for row in results)
+
+                    # Step 3: Filter eligible players for top 10 and top 20
+                    top_10 = [row for row in results if row[1] >= max_total_matches * 0.5]
+                    top_20 = [row for row in results if row[1] >= max_total_matches * 0.75]
+
+                    # Step 4: Sort by skill rating descending
+                    top_10 = sorted(top_10, key=lambda r: r[4], reverse=True)[:10]
+                    top_20 = sorted(top_20, key=lambda r: r[4], reverse=True)[:20]
+
+                    display_rows = top_20
+
+                    scroll_view.clear_widgets()
+
+                    leaderboard_grid = GridLayout(cols=10, padding=[5, 5], spacing=[5, 5], size_hint_y=None)
+                    leaderboard_grid.bind(minimum_height=leaderboard_grid.setter('height'))
+
+                    header_labels = [
+                        '', 'Rank', 'Player Name', 'Matches', 'Total Kills',
+                        'Total Flags', 'Skill Rating', 'Win Ratio', 'Last updated level', 'Country Flag'
+                    ]
+                    for i, header in enumerate(header_labels):
+                        lbl = Label(text=header, size_hint_y=None, height=40)
+                        lbl.size_hint_x = 0.1 if i == 0 else 1.5
+                        leaderboard_grid.add_widget(lbl)
+
+                    for idx, row in enumerate(display_rows):
+                        final_skill_rating = float(row[4])
+                        tier, badge_filename = self.get_tier_and_badge(final_skill_rating)
+
+                        if badge_filename:
+                            badge_path = self.resource_path(os.path.join("badges", badge_filename))
+                            badge_img = Image(source=badge_path, size_hint_x=None, size_hint_y=None, size=(40, 40))
+                        else:
+                            badge_img = Widget(size_hint=(None, None), size=(32, 32))
+
+                        leaderboard_grid.add_widget(badge_img)
+                        leaderboard_grid.add_widget(
+                            Label(text=str(idx + 1), size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        player_name = row[0]
+                        truncated_name = (player_name[:15] + '...') if len(player_name) > 15 else player_name
+                        leaderboard_grid.add_widget(
+                            Label(text=truncated_name, size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        for value in row[1:4]:
+                            leaderboard_grid.add_widget(
+                                Label(text=str(value), size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        skill_box = BoxLayout(size_hint=(1, None), height=40, padding=5)
+
+                        with skill_box.canvas.before:
+                            Color(1, 1, 0, 0.3)
+                            background_rect = Rectangle(size=skill_box.size, pos=skill_box.pos)
+
+                        skill_box.bind(size=lambda inst, val, r=background_rect: setattr(r, 'size', inst.size))
+                        skill_box.bind(pos=lambda inst, val, r=background_rect: setattr(r, 'pos', inst.pos))
+
+                        skill_box.add_widget(Label(text=f"{row[4]:.2f}", font_size=16, color=(0, 0, 0, 1)))
+                        leaderboard_grid.add_widget(skill_box)
+
+                        leaderboard_grid.add_widget(
+                            Label(text=f"{row[5]:.2f}%", size_hint_x=1.5, size_hint_y=None, height=40))
+                        leaderboard_grid.add_widget(
+                            Label(text=str(row[6]), size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        flag_container = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+                        spacer = Widget(size_hint_x=None, width=32)
+                        flag_path = self.get_flag_path(row[7])
+                        flag_img = Image(source=flag_path, size_hint=(None, None), size=(30, 30))
+                        flag_container.add_widget(spacer)
+                        flag_container.add_widget(flag_img)
+                        leaderboard_grid.add_widget(flag_container)
+
+                    scroll_view.add_widget(leaderboard_grid)
+                    show_popup("Refreshed", "Leaderboard has been refreshed successfully!")
+
+                except mysql.connector.Error as err:
+                    print(f"Refresh error: {err}")
+                    show_popup("Refresh Failed", str(err))
+
+            # Initial Load
+            load_leaderboard_data()
             leaderboard_content.add_widget(scroll_view)
 
-            close_button = Button(text='Close', size_hint=(None, None), size=(100, 40), pos_hint={'center_x': 0.5})
-            leaderboard_content.add_widget(close_button)
+            button_layout = BoxLayout(size_hint=(1, None), height=40, spacing=10)
+            refresh_button = Button(text='Refresh', size_hint=(None, None), size=(100, 40))
+            close_button = Button(text='Close', size_hint=(None, None), size=(100, 40))
 
-            leaderboard_popup = Popup(title='Leaderboard', content=leaderboard_content, size_hint=(1, 0.75))
-            close_button.bind(on_press=leaderboard_popup.dismiss)
+            leaderboard_popup = Popup(title=popup_title, content=leaderboard_content, size_hint=(1, 0.75))
+
+            def on_leaderboard_dismiss(instance):
+                if self.refresh_popup and self.refresh_popup.parent:
+                    self.refresh_popup.dismiss()
+                    self.refresh_popup = None
+
+            leaderboard_popup.bind(on_dismiss=on_leaderboard_dismiss)
+            refresh_button.bind(on_press=load_leaderboard_data)
+            close_button.bind(on_press=lambda x: leaderboard_popup.dismiss())
+
+            button_layout.add_widget(Widget(size_hint=(1, None), height=40))
+            button_layout.add_widget(refresh_button)
+            button_layout.add_widget(close_button)
+            button_layout.add_widget(Widget(size_hint=(1, None), height=40))
+
+            leaderboard_content.add_widget(button_layout)
             leaderboard_popup.open()
 
         except mysql.connector.Error as err:
             print(f"Error occurred: {err}")
             self.show_popup("Database Error", str(err))
 
-    def show_statistical_leaderboard(self, instance=None, sort_field='XPG'):
-        # Close existing leaderboard if open
-        if hasattr(self, 'leaderboard_popup') and self.leaderboard_popup:
-            self.leaderboard_popup.dismiss()
-
+    def show_leaderboard(self, instance):
         try:
-            cursor = self.conn.cursor()
-            query = f'''
-                SELECT
-                    player_name, total_matches, xp, KPG, FPG, final_skill_rating,
-                    overall_win_ratio, last_updated_player_level, country_flag, XPG
-                FROM overall_player_skill_rating
-                ORDER BY {sort_field} DESC
-            '''
-            cursor.execute(query)
-            results = cursor.fetchall()
-
             leaderboard_content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+            scroll_view = ScrollView(size_hint=(1, None), size=(900, 400))
+            self.refresh_popup = None  # Store popup ref as an instance attribute
 
-            # Dropdown to select sort field
-            sort_spinner = Spinner(
-                text='Sort by XP/Game',
-                values=('XPG', 'KPG', 'FPG', 'final_skill_rating', 'overall_win_ratio'),
-                size_hint=(None, None),
-                size=(200, 40)
-            )
+            def show_popup(title, message):
+                # If popup already open, don't open another
+                if self.refresh_popup and self.refresh_popup.parent:
+                    return
 
-            def on_sort_change(spinner, text):
-                self.show_statistical_leaderboard(sort_field=text)
+                content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+                content.add_widget(Label(text=message))
+                btn = Button(text='OK', size_hint=(None, None), size=(100, 40), pos_hint={'center_x': 0.5})
+                content.add_widget(btn)
+                popup = Popup(title=title, content=content, size_hint=(0.6, 0.4))
+                btn.bind(on_press=popup.dismiss)
 
-            sort_spinner.bind(text=on_sort_change)
-            leaderboard_content.add_widget(sort_spinner)
+                def on_dismiss(instance):
+                    self.refresh_popup = None
 
-            scroll_view = ScrollView(size_hint=(1, None), size=(700, 400))
-            leaderboard_grid = GridLayout(cols=10, padding=10, spacing=10, size_hint_y=None)
-            leaderboard_grid.bind(minimum_height=leaderboard_grid.setter('height'))
+                popup.bind(on_dismiss=on_dismiss)
+                popup.open()
+                self.refresh_popup = popup
 
-            headers = [
-                'Rank', 'Player Name', 'Matches', 'XP/Game', 'Kills/Game',
-                'Flags/Game', 'Skill Rating', 'Win Ratio', 'Last Level', 'Flag'
-            ]
-            for header in headers:
-                leaderboard_grid.add_widget(Label(text=header, size_hint_y=None, height=40, bold=True))
+                # Auto-dismiss after 1.5 seconds
+                Clock.schedule_once(lambda dt: popup.dismiss(), 1.5)
 
-            for idx, row in enumerate(results):
-                player_name, matches, xp, kpg, fpg, rating, win_ratio, level, flag, xpg = row
+            def load_leaderboard_data(*args):
+                try:
+                    conn = mysql.connector.connect(
+                        host=DB_HOST,
+                        user=DB_USERNAME,
+                        password=DB_PASSWORD,
+                        database=DB_NAME,
+                        port=DB_PORT
+                    )
+                    cursor = conn.cursor()
+                    query = ''' 
+                        SELECT
+                            player_name,
+                            total_matches,
+                            kills,
+                            flags_captured,
+                            final_skill_rating,
+                            overall_win_ratio,
+                            last_updated_player_level,
+                            country_flag
+                        FROM overall_player_skill_rating
+                        ORDER BY final_skill_rating DESC
+                    '''
+                    print("Executing SQL Query:", query)
+                    cursor.execute(query)
+                    results = cursor.fetchall()
+                    print("Fetched Results:", results)
+                    conn.close()
 
-                leaderboard_grid.add_widget(Label(text=str(idx + 1), size_hint_y=None, height=40))
+                    scroll_view.clear_widgets()
 
-                truncated_name = (player_name[:15] + '...') if len(player_name) > 15 else player_name
-                leaderboard_grid.add_widget(Label(text=truncated_name, size_hint_y=None, height=40))
+                    leaderboard_grid = GridLayout(cols=10, padding=[5, 5], spacing=[5, 5], size_hint_y=None)
+                    leaderboard_grid.bind(minimum_height=leaderboard_grid.setter('height'))
 
-                leaderboard_grid.add_widget(Label(text=str(matches), size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(xpg), size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(kpg), size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(fpg), size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=f"{rating:.2f}", size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=f"{win_ratio:.2f}%", size_hint_y=None, height=40))
-                leaderboard_grid.add_widget(Label(text=str(level), size_hint_y=None, height=40))
+                    header_labels = [
+                        '', 'Rank', 'Player Name', 'Matches', 'Total Kills',
+                        'Total Flags', 'Skill Rating', 'Win Ratio', 'Last updated level', 'Country Flag'
+                    ]
+                    for i, header in enumerate(header_labels):
+                        lbl = Label(text=header, size_hint_y=None, height=40)
+                        lbl.size_hint_x = 0.1 if i == 0 else 1.5
+                        leaderboard_grid.add_widget(lbl)
 
-                # Country flag
-                flag_path = self.get_flag_path(flag)
+                    for idx, row in enumerate(results):
+                        final_skill_rating = float(row[4])
+                        tier, badge_filename = self.get_tier_and_badge(final_skill_rating)
 
-                flag_container = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
-                spacer = Widget(size_hint_x=None, width=32)
-                flag_image = Image(source=flag_path, size_hint=(None, None), size=(30, 30))
-                flag_container.add_widget(spacer)
-                flag_container.add_widget(flag_image)
-                leaderboard_grid.add_widget(flag_container)
+                        if badge_filename:
+                            badge_path = self.resource_path(os.path.join("badges", badge_filename))
+                            badge_img = Image(source=badge_path, size_hint_x=None, size_hint_y=None, size=(40, 40))
+                        else:
+                            badge_img = Widget(size_hint=(None, None), size=(32, 32))
 
-            scroll_view.add_widget(leaderboard_grid)
+                        leaderboard_grid.add_widget(badge_img)
+                        leaderboard_grid.add_widget(
+                            Label(text=str(idx + 1), size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        player_name = row[0]
+                        truncated_name = (player_name[:15] + '...') if len(player_name) > 15 else player_name
+                        leaderboard_grid.add_widget(
+                            Label(text=truncated_name, size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        for value in row[1:4]:
+                            leaderboard_grid.add_widget(
+                                Label(text=str(value), size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        skill_box = BoxLayout(size_hint=(1, None), height=40, padding=5)
+                        with skill_box.canvas.before:
+                            Color(1, 1, 0, 0.3)
+                            rect = Rectangle(size=skill_box.size, pos=skill_box.pos)
+
+                        def update_rect(instance, value, rect=rect):
+                            rect.size = instance.size
+                            rect.pos = instance.pos
+
+                        skill_box.bind(size=update_rect, pos=update_rect)
+                        skill_box.add_widget(Label(text=f"{row[4]:.2f}", font_size=16, color=(0, 0, 0, 1)))
+                        leaderboard_grid.add_widget(skill_box)
+
+                        leaderboard_grid.add_widget(
+                            Label(text=f"{row[5]:.2f}%", size_hint_x=1.5, size_hint_y=None, height=40))
+                        leaderboard_grid.add_widget(
+                            Label(text=str(row[6]), size_hint_x=1.5, size_hint_y=None, height=40))
+
+                        flag_container = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+                        spacer = Widget(size_hint_x=None, width=32)
+                        flag_path = self.get_flag_path(row[7])
+                        flag_img = Image(source=flag_path, size_hint=(None, None), size=(30, 30))
+                        flag_container.add_widget(spacer)
+                        flag_container.add_widget(flag_img)
+                        leaderboard_grid.add_widget(flag_container)
+
+                    scroll_view.add_widget(leaderboard_grid)
+                    show_popup("Refreshed", "Leaderboard has been refreshed successfully!")
+
+                except mysql.connector.Error as err:
+                    print(f"Refresh error: {err}")
+                    show_popup("Refresh Failed", str(err))
+
+            # Initial load
+            load_leaderboard_data()
             leaderboard_content.add_widget(scroll_view)
 
-            close_button = Button(text='Close', size_hint=(None, None), size=(100, 40), pos_hint={'center_x': 0.5})
-            leaderboard_content.add_widget(close_button)
+            button_layout = BoxLayout(size_hint=(1, None), height=40, spacing=10)
+            refresh_button = Button(text='Refresh', size_hint=(None, None), size=(100, 40))
+            close_button = Button(text='Close', size_hint=(None, None), size=(100, 40))
 
-            self.leaderboard_popup = Popup(
-                title='Statistical Leaderboard',
-                content=leaderboard_content,
-                size_hint=(1, 0.85)
-            )
-            close_button.bind(on_press=self.leaderboard_popup.dismiss)
-            self.leaderboard_popup.open()
+            leaderboard_popup = Popup(title='Leaderboard', content=leaderboard_content, size_hint=(1, 0.75))
+
+            def on_leaderboard_dismiss(instance):
+                if self.refresh_popup and self.refresh_popup.parent:
+                    self.refresh_popup.dismiss()
+                    self.refresh_popup = None
+
+            leaderboard_popup.bind(on_dismiss=on_leaderboard_dismiss)
+
+            refresh_button.bind(on_press=load_leaderboard_data)
+            close_button.bind(on_press=lambda x: leaderboard_popup.dismiss())
+
+            button_layout.add_widget(Widget(size_hint=(1, None), height=40))
+            button_layout.add_widget(refresh_button)
+            button_layout.add_widget(close_button)
+            button_layout.add_widget(Widget(size_hint=(1, None), height=40))
+
+            leaderboard_content.add_widget(button_layout)
+
+            leaderboard_popup.open()
 
         except mysql.connector.Error as err:
             print(f"Error occurred: {err}")
             self.show_popup("Database Error", str(err))
+
+    def _on_stat_sort_change(self, spinner, text, sort_spinner=None):
+        self.show_statistical_leaderboard(sort_field=text)
+
+    def _on_stat_sort_change(self, spinner, text, sort_spinner=None):
+        self.show_statistical_leaderboard(sort_field=text)
 
     def _update_leaderboard_rect(self, instance, value):
         # Update the rectangle size and position for the background of the leaderboard
@@ -4448,6 +5661,8 @@ class SkillRatingApp(MDApp):
         self.popup.open()
 
     def ask_for_admin_password(self, callback):
+        import bcrypt  # Ensure bcrypt is available
+
         def fetch_stored_password():
             try:
                 cursor = self.conn.cursor()
@@ -4463,8 +5678,15 @@ class SkillRatingApp(MDApp):
             return  # Abort if password couldn't be fetched
 
         password_content = BoxLayout(orientation='vertical', padding=10, spacing=10)
-        password_input = TextInput(multiline=False, password=True, hint_text="Enter Admin Password", size_hint_y=None,
-                                   height=36)
+
+        password_input = TextInput(
+            multiline=False,
+            password=True,
+            hint_text="Enter Admin Password",
+            size_hint_y=None,
+            height=36
+        )
+
         password_content.add_widget(Label(text="Admin password required:", size_hint_y=None, height=30))
         password_content.add_widget(password_input)
 
@@ -4478,7 +5700,8 @@ class SkillRatingApp(MDApp):
         popup = Popup(title='Admin Access', content=password_content, size_hint=(0.5, 0.3), auto_dismiss=False)
 
         def on_confirm(instance):
-            if password_input.text == stored_password:
+            entered_password = password_input.text.strip()
+            if bcrypt.checkpw(entered_password.encode('utf-8'), stored_password.encode('utf-8')):
                 popup.dismiss()
                 callback()
             else:
@@ -4487,8 +5710,243 @@ class SkillRatingApp(MDApp):
 
         confirm_btn.bind(on_press=on_confirm)
         cancel_btn.bind(on_press=lambda x: popup.dismiss())
+
         popup.open()
 
+    def resource_path(self,relative_path):
+        """ Get absolute path to resource, works for development and for PyInstaller. """
+        try:
+            base_path = sys._MEIPASS  # Set by PyInstaller
+        except AttributeError:
+            base_path = os.path.abspath(".")
+
+        full_path = os.path.join(base_path, relative_path)
+        if not os.path.exists(full_path):
+            print(f"[ERROR] Resource NOT FOUND: {full_path}")
+        else:
+            print(f"[FOUND] Resource: {full_path}")
+        return full_path
+
+    def load_player_inputs(self):
+        def on_file_selected(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                if not data or not isinstance(data, dict):
+                    self.show_popup("Error", "The file is empty or not in the correct JSON object format.")
+                    return
+
+                self.player_inputs_layout.clear_widgets()
+                self.players.clear()
+
+                required_fields = {"team", "static_inputs", "dynamic_segments"}
+
+                for name, pdata in data.items():
+                    try:
+                        if not isinstance(pdata, dict):
+                            self.show_popup("Error", f"Player '{name}' data must be a dictionary.")
+                            continue
+
+                        missing = required_fields - pdata.keys()
+                        if missing:
+                            self.show_popup("Error", f"Player '{name}' is missing fields: {', '.join(missing)}.")
+                            continue
+
+                        team = pdata["team"]
+                        if team not in {"Red", "Blue"}:
+                            self.show_popup("Error",
+                                            f"Player '{name}' has invalid team '{team}'. Must be 'Red' or 'Blue'.")
+                            continue
+
+                        real_name = pdata.get("name", name)
+                        self.add_player_inputs(team, real_name)
+
+                        player = self.players[-1]
+                        static_inputs = pdata["static_inputs"]
+
+                        if not isinstance(static_inputs, list) or not all(
+                                isinstance(x, (str, int, float)) for x in static_inputs):
+                            self.show_popup("Error", f"Static inputs for player '{name}' are invalid.")
+                            continue
+
+                        while len(static_inputs) < 6:
+                            static_inputs.append("")
+
+                        static_inputs[3] = "8"
+                        static_inputs[4] = "00"
+
+                        for field, value in zip(player['inputs'][:6], static_inputs):
+                            field.text = str(value)
+
+                        dynamic_segments = pdata["dynamic_segments"]
+                        if not isinstance(dynamic_segments, list):
+                            self.show_popup("Error", f"Dynamic segments for player '{name}' must be a list.")
+                            continue
+
+                        has_dynamic = any(segment and isinstance(segment, dict) and any(segment.values()) for segment in
+                                          dynamic_segments)
+                        if has_dynamic:
+                            for child in player['player_box'].children:
+                                if isinstance(child, Button) and "insert" in child.text.lower():
+                                    child.trigger_action(duration=0)
+                                    break
+
+                            for i, segment in enumerate(dynamic_segments):
+                                if not isinstance(segment, dict):
+                                    self.show_popup("Error", f"Segment #{i + 1} for '{name}' is not a dictionary.")
+                                    continue
+
+                                for key in ['kills', 'flags', 'minutes', 'seconds']:
+                                    if key not in segment:
+                                        self.show_popup("Error", f"Segment #{i + 1} for '{name}' is missing '{key}'.")
+                                        continue
+
+                                dynamic_inputs = player['inputs'][6:]
+                                if len(dynamic_inputs) == 3:
+                                    kills_field = dynamic_inputs[0]
+                                    flags_field = dynamic_inputs[1]
+                                    time_layout = dynamic_inputs[2]
+
+                                    kills_field.text = str(segment.get("kills", ""))
+                                    flags_field.text = str(segment.get("flags", ""))
+
+                                    if hasattr(time_layout, "children") and len(time_layout.children) == 2:
+                                        minute_input = time_layout.children[1]
+                                        second_input = time_layout.children[0]
+                                        minute_input.text = str(segment.get("minutes", ""))
+                                        second_input.text = str(segment.get("seconds", ""))
+
+                    except Exception as player_error:
+                        self.show_popup("Error", f"Error loading player '{name}': {str(player_error)}")
+                        continue
+
+                self.show_popup("Loaded", "Player data loaded successfully!")
+                self.submit_button.disabled = False
+
+                if hasattr(self, 'video_player_layout') and self.video_player_layout in self.main_layout.children:
+                    self.main_layout.remove_widget(self.video_player_layout)
+                if hasattr(self, 'refresh_button') and self.refresh_button in self.main_layout.children:
+                    self.main_layout.remove_widget(self.refresh_button)
+                if hasattr(self, 'achievement_label') and self.achievement_label in self.main_layout.children:
+                    self.main_layout.remove_widget(self.achievement_label)
+                self.main_layout.remove_widget(self.seasons_button)
+                self.main_layout.remove_widget(self.stats_label)
+
+                moving_gif = MovingGIF(
+                    gif_source=resource_path('positions/tank3.gif'),
+                    start_x=Window.width,
+                    start_y=615,
+                    end_x=-100,
+                    duration=15
+                )
+                self.main_layout.add_widget(moving_gif)
+
+                self.create_stats_layout()
+
+            except json.JSONDecodeError as e:
+                self.show_popup("Error", f"Invalid JSON format: {e.msg} at line {e.lineno}, column {e.colno}")
+            except Exception as e:
+                self.show_popup("Error", f"Unexpected error while loading file: {str(e)}")
+
+        popup = FileChooserPopup("Load Player Data", on_file_selected)
+        popup.open()
+
+    def add_dynamic_segment_to_player(self, player, kills="", flags="", minutes="", seconds=""):
+        from kivy.uix.textinput import TextInput
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.label import Label
+
+        # Create dynamic fields
+        new_kills_input = TextInput(hint_text="Kills", input_filter='int', size_hint_y=None, height=40, text=kills)
+        new_flags_input = TextInput(hint_text="Flags Captured", input_filter='int', size_hint_y=None, height=40,
+                                    text=flags)
+        time_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
+        minute_input = TextInput(hint_text="Minutes", input_filter='int', size_hint_x=0.5, text=minutes)
+        second_input = TextInput(hint_text="Seconds", input_filter='int', size_hint_x=0.5, text=seconds)
+        time_layout.add_widget(minute_input)
+        time_layout.add_widget(second_input)
+
+        # Add to UI
+        player['player_box'].add_widget(new_kills_input)
+        player['player_box'].add_widget(new_flags_input)
+        player['player_box'].add_widget(time_layout)
+        player['player_box'].add_widget(Label(size_hint_y=None, height=10))
+
+        # Add to player's input list
+        player['inputs'].extend([new_kills_input, new_flags_input, time_layout])
+
+    def clear_dynamic_fields_for_player(self, player):
+        """
+        Removes all dynamic fields (kills, flags, time) from the player's input UI and input list.
+        """
+        # Only keep the first 6 (static) inputs
+        static_inputs_count = 6
+        dynamic_inputs = player['inputs'][static_inputs_count:]
+        player['inputs'] = player['inputs'][:static_inputs_count]
+
+        # Remove dynamic widgets from the UI
+        for widget in dynamic_inputs:
+            # Time fields are in a BoxLayout, others are TextInputs
+            if widget in player['player_box'].children:
+                player['player_box'].remove_widget(widget)
+            elif hasattr(widget, 'parent') and widget.parent is not None:
+                widget.parent.remove_widget(widget)
+
+    def save_player_inputs(self):
+        def on_save(file_path):
+            data = {}  # ... build your data dict ...
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                self.show_popup("Saved", f"Player data saved to {file_path}")
+            except Exception as e:
+                self.show_popup("Error", f"Failed to save file: {e}")
+
+        popup = FileSavePopup(
+            "Save Player Data As",
+            on_save,
+            filetypes=[("JSON Files", ".json"), ("Text Files", ".txt"), ("CSV Files", ".csv"), ("All Files", ".*")]
+        )
+        popup.open()
+
+    def process_save_player_inputs(self, file_path):
+        data = {}
+        for player in self.players:
+            name = player['name_getter']()
+            static_inputs = [field.text for field in player['inputs'][:6]]
+            dynamic_segments = []
+            dynamic_inputs = player['inputs'][6:]
+            for i in range(0, len(dynamic_inputs), 3):
+                kills_field = dynamic_inputs[i]
+                flags_field = dynamic_inputs[i + 1]
+                time_layout = dynamic_inputs[i + 2]
+                minutes = ""
+                seconds = ""
+                for child in time_layout.children:
+                    if hasattr(child, 'hint_text'):
+                        if 'Minutes' in child.hint_text:
+                            minutes = child.text
+                        elif 'Seconds' in child.hint_text:
+                            seconds = child.text
+                dynamic_segments.append({
+                    "kills": kills_field.text,
+                    "flags": flags_field.text,
+                    "minutes": minutes,
+                    "seconds": seconds
+                })
+            data[name] = {
+                "team": player['team'],
+                "static_inputs": static_inputs,
+                "dynamic_segments": dynamic_segments
+            }
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self.show_popup("Saved", f"Player data saved to {file_path}")
+        except Exception as e:
+            self.show_popup("Error", f"Failed to save file: {e}")
 
 
 if __name__ == '__main__':
