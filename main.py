@@ -1,5 +1,5 @@
 import shutil
-
+from kivy.core.window import Window
 import bcrypt
 import mysql.connector  # MySQL Driver
 from dotenv import load_dotenv
@@ -55,6 +55,7 @@ Window.set_icon('icon.ico')
 load_dotenv()
 RAPIDAPI_KEYS = os.getenv('RAPIDAPI_KEYS', '').split(',')
 RAPIDAPI_HOST = os.getenv('RAPIDAPI_HOST', 'ocr43.p.rapidapi.com')
+
 
 def ocr_api_request(file_path):
     with open(file_path, "rb") as f:
@@ -1287,7 +1288,7 @@ class SkillRatingApp(MDApp):
     def rebuild_ui(self):
         # Clear existing widgets
         self.main_layout.clear_widgets()
-
+        Window.clearcolor = (0, 0, 0, 1)
         # Rebuild the UI components
         self.build()
 
@@ -1527,6 +1528,7 @@ class SkillRatingApp(MDApp):
         )
         label.bind(texture_size=label.setter('size'))  # Resize to fit content
 
+
         scroll = ScrollView(size_hint=(1, 1))
         scroll.add_widget(label)
 
@@ -1561,6 +1563,9 @@ class SkillRatingApp(MDApp):
 
 
     def build(self):
+
+
+
         self.root = FloatLayout()
         self.splash = FurySplashScreen(self.show_main_ui)
         self.root.add_widget(self.splash)
@@ -1582,6 +1587,20 @@ class SkillRatingApp(MDApp):
 
         print("Building the main layout.")
         self.main_layout = FloatLayout()
+
+
+
+        # Set the background color to black
+        self.main_layout.canvas.before.clear()
+        with self.main_layout.canvas.before:
+            Color(0, 0, 0, 1)  # Set the color to black
+            self.rect = Rectangle(size=self.main_layout.size, pos=self.main_layout.pos)
+        # Bind the size and position of the rectangle to the main layout
+        self.main_layout.bind(size=self._update_rect, pos=self._update_rect)
+
+
+
+
 
         self.title_gif = Image(
             source=resource_path('positions/title.gif'),
@@ -1642,7 +1661,8 @@ class SkillRatingApp(MDApp):
             keep_ratio=True,
             size_hint=(1, None),  # Full width, height to be defined
             size=(Window.width, 800),  # Set a fixed height for the background image
-            pos_hint={'x': 0, 'y': 0}  # Positioning it at the bottom
+            pos_hint={'x': 0, 'y': 0}
+
         )
         self.main_layout.add_widget(self.background_image)
         Clock.schedule_interval(self.update_bg_image, 60)
