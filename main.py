@@ -1,6 +1,10 @@
+from kivy.config import Config
+Config.set('graphics', 'resizable', '0')
+Config.set('graphics', 'width', '1000')
+Config.set('graphics', 'height', '765')
 import shutil
+import traceback
 from threading import Thread
-
 import requests
 from kivy.core.window import Window
 import bcrypt
@@ -232,7 +236,7 @@ def get_special_folder(name):
     return str(folders.get(name, home))
 
 
-def check_for_updates(current_version="3.0.0"):
+def check_for_updates(current_version="4.0.0"):
     url = "https://itch.io/api/1/x/wharf/latest"
     params = {
         "target": "fury-to2/to2skillratingapp",
@@ -966,7 +970,7 @@ def style_button(button):
 
 
 TIER_DEFINITIONS = [
-    {"name": "Bronze", "min": 0.0, "max": 4.0, "badge": "bronze_badge.png"},
+    {"name": "Bronze", "min": 0.01, "max": 4.0, "badge": "bronze_badge.png"},
     {"name": "Silver", "min": 4.0, "max": 6.5, "badge": "silver_badge.png"},
     {"name": "Gold", "min": 6.5, "max": 8.5, "badge": "gold_badge.png"},
     {"name": "Master", "min": 8.5, "max": None, "badge": "master_badge.png"},  # No upper limit
@@ -1149,12 +1153,12 @@ class SkillRatingApp(MDApp):
 
     def retry_check_app_version(self):
         try:
-            self.check_app_version(APP_VERSION="3.0.0")
+            self.check_app_version(APP_VERSION="4.0.0")
         except Exception as e:
             print(f"Retry version check failed: {e}")
             self.show_no_connection_popup()
 
-    def check_app_version(self, APP_VERSION="3.0.0"):
+    def check_app_version(self, APP_VERSION="4.0.0"):
         try:
             if getattr(sys, 'frozen', False):
                 dotenv_path = os.path.join(sys._MEIPASS, '.env')
@@ -1290,7 +1294,7 @@ class SkillRatingApp(MDApp):
     def try_again_connection(self, *args):
         print("[INFO] Retrying database connection...")
         try:
-            self.check_app_version(APP_VERSION="3.0.0")
+            self.check_app_version(APP_VERSION="4.0.0")
             if self.conn:
                 print("[INFO] Reconnection successful.")
                 self.popup.dismiss()
@@ -1604,7 +1608,7 @@ class SkillRatingApp(MDApp):
         self.root.remove_widget(self.splash)
 
         try:
-            self.check_app_version(APP_VERSION="3.0.0")
+            self.check_app_version(APP_VERSION="4.0.0")
         except Exception as e:
             print(f"Startup error: {e}")
             Clock.schedule_once(lambda dt: self.show_no_connection_popup(), 0)
@@ -2675,7 +2679,8 @@ class SkillRatingApp(MDApp):
         )
 
         input_layout.add_widget(end_season_button)
-        end_season_button.bind(on_press=self.end_season)
+        # Bind to a wrapper method
+        end_season_button.bind(on_press=self.confirm_end_season)
         input_layout.add_widget(no_mayhem_layout)
 
         countdown_button_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=40, spacing=10)
@@ -3005,18 +3010,34 @@ class SkillRatingApp(MDApp):
             self.conn.rollback()
             self.show_popup("Error", f"Failed to revert match number {match_number}: {e}")
 
+    def confirm_end_season(self, instance):
+        def on_confirm():
+            self.end_season(instance)
+
+        def on_cancel():
+            print("Season end canceled.")
+
+        popup = ConfirmationPopup(
+            title="Confirm End Season",
+            message="Are you sure you want to end the season? This will archive current data and reset the stats.",
+            on_confirm=on_confirm,
+            on_cancel=on_cancel
+        )
+        popup.open()
+
     def end_season(self, instance):
         try:
             cursor = self.conn.cursor()
 
-            # Step 1: Check for existing season tables
+
+            # Step 1: Determine next season number
             cursor.execute("SHOW TABLES LIKE 'Player_skill_rating_season_%'")
             existing_tables = cursor.fetchall()
             season_numbers = [int(table[0].split('_')[-1]) for table in existing_tables]
             next_season_number = max(season_numbers) + 1 if season_numbers else 1
 
-            # Step 2: Create the new season table
-            create_table_query = f"""
+            # Step 2: Create Player_skill_rating_season_{n} table
+            create_agg_table_query = f"""
             CREATE TABLE Player_skill_rating_season_{next_season_number} (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 player_name VARCHAR(255) NOT NULL UNIQUE,
@@ -3035,35 +3056,75 @@ class SkillRatingApp(MDApp):
                 country_flag VARCHAR(255) DEFAULT 'default.png'
             )
             """
-            cursor.execute(create_table_query)
+            cursor.execute(create_agg_table_query)
 
-            # Step 3: Transfer data from overall_player_skill_rating to the new season table
-            transfer_query = f"""
-            INSERT INTO Player_skill_rating_season_{next_season_number} (
-                player_name, kills, xp, flags_captured, last_updated_player_level,
-                total_matches, final_skill_rating, overall_win_ratio,
-                red_team_win_rate, blue_team_win_rate, KPG, FPG, XPG, country_flag
+            # Step 2.5: Create Player_skill_rating_{n} table
+            create_detailed_table_query = f"""
+            CREATE TABLE Player_skill_rating_{next_season_number} (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                final_team VARCHAR(50) DEFAULT 'Unknown',
+                player_name VARCHAR(255) NOT NULL,
+                kills INT NOT NULL DEFAULT 0,
+                xp INT NOT NULL DEFAULT 0,
+                flags_captured INT NOT NULL DEFAULT 0,
+                player_level INT NOT NULL DEFAULT 0,
+                skill_rating FLOAT NOT NULL DEFAULT 0,
+                match_number INT,
+                outcome VARCHAR(255) NOT NULL DEFAULT 'Unknown'
             )
-            SELECT
-                player_name, kills, xp, flags_captured, last_updated_player_level,
-                total_matches, final_skill_rating, overall_win_ratio,
-                red_team_win_rate, blue_team_win_rate, KPG, FPG, XPG, country_flag
-            FROM overall_player_skill_rating
             """
-            cursor.execute(transfer_query)
+            cursor.execute(create_detailed_table_query)
 
-            # Step 4: Clear the current season table
+            # Step 3: Transfer data from overall_player_skill_rating → season aggregate table
+            cursor.execute("SELECT COUNT(*) FROM overall_player_skill_rating")
+            if cursor.fetchone()[0] > 0:
+                transfer_agg_query = f"""
+                INSERT INTO Player_skill_rating_season_{next_season_number} (
+                    player_name, kills, xp, flags_captured, last_updated_player_level,
+                    total_matches, final_skill_rating, overall_win_ratio,
+                    red_team_win_rate, blue_team_win_rate, KPG, FPG, XPG, country_flag
+                )
+                SELECT
+                    player_name, kills, xp, flags_captured, last_updated_player_level,
+                    total_matches, final_skill_rating, overall_win_ratio,
+                    red_team_win_rate, blue_team_win_rate, KPG, FPG, XPG, country_flag
+                FROM overall_player_skill_rating
+                """
+                cursor.execute(transfer_agg_query)
+
+            # Step 3.5: Transfer player_skill_rating → detailed season table
+            cursor.execute("SELECT COUNT(*) FROM player_skill_rating")
+            if cursor.fetchone()[0] > 0:
+                transfer_detailed_query = f"""
+                INSERT INTO Player_skill_rating_{next_season_number} (
+                    id, final_team, player_name, kills, xp, flags_captured, player_level,
+                    skill_rating, match_number, outcome
+                )
+                SELECT
+                    id, final_team, player_name, kills, xp, flags_captured, player_level,
+                    skill_rating, match_number, outcome
+                FROM player_skill_rating
+                """
+                cursor.execute(transfer_detailed_query)
+
+            # Step 4: Clear the current tables (matches must be deleted last)
+            cursor.execute("DELETE FROM player_skill_rating")
             cursor.execute("DELETE FROM overall_player_skill_rating")
+            cursor.execute("DELETE FROM matches")
+
+            # Step 5: Commit all changes
             self.conn.commit()
 
-            # Step 5: Optional logic – get max total matches from new table
+            # Step 6: Optionally fetch max total matches
             cursor.execute(f"SELECT MAX(total_matches) FROM Player_skill_rating_season_{next_season_number}")
             max_total_matches = cursor.fetchone()[0]
 
-            # Step 6: Notify success
-            self.show_popup("Season Ended", f"Season {next_season_number} ended. Data transferred successfully.")
+            # Step 7: Notify success
+            self.show_popup("Season Ended", f"Season {next_season_number} ended successfully. Data transferred.")
 
         except Exception as e:
+            self.conn.rollback()
+            traceback.print_exc()
             self.show_popup("Error", f"Failed to end the season: {e}")
 
     def save_video_url(self, url):
@@ -3985,8 +4046,11 @@ class SkillRatingApp(MDApp):
     def go_to_home(self, instance):
         # Clear the input layout of any player input fields
 
-        self.main_layout.add_widget(self.seasons_button)
-        self.main_layout.add_widget(self.stats_label)
+        if hasattr(self, 'seasons_button') and self.seasons_button not in self.main_layout.children:
+            self.main_layout.add_widget(self.seasons_button)
+
+        if hasattr(self, 'stats_label') and self.stats_label not in self.main_layout.children:
+            self.main_layout.add_widget(self.stats_label)
 
         if hasattr(self, 'achievement_label') and self.achievement_label not in self.main_layout.children:
             self.main_layout.add_widget(self.achievement_label)
@@ -3996,25 +4060,21 @@ class SkillRatingApp(MDApp):
         if hasattr(self, 'players'):
             self.players.clear()
 
-        # Remove the input layout if it exists
         if hasattr(self, 'input_layout') and self.input_layout in self.main_layout.children:
             self.main_layout.remove_widget(self.input_layout)
 
-        # Ensure only one instance of the video player layout is added
         if hasattr(self, 'video_player_layout'):
             if self.video_player_layout not in self.main_layout.children:
                 self.main_layout.add_widget(self.video_player_layout)
 
-        if self.video_player not in self.video_player_layout.children:
+        if hasattr(self, 'video_player') and self.video_player not in self.video_player_layout.children:
             self.video_player_layout.add_widget(self.video_player)
 
-        # Remove and re-add the refresh button to avoid duplication
         if hasattr(self, 'refresh_button'):
             if self.refresh_button in self.main_layout.children:
                 self.main_layout.remove_widget(self.refresh_button)
             self.main_layout.add_widget(self.refresh_button)
 
-        # Disable submit and export buttons if they exist
         if hasattr(self, 'submit_button'):
             self.submit_button.disabled = True
         if hasattr(self, 'export_button'):
@@ -6000,7 +6060,7 @@ class SkillRatingApp(MDApp):
 
 if __name__ == '__main__':
     # Set the window size
-    Window.size = (750, 740)
+    Window.size = (1000, 765)
 
     # You may want to hide the maximize button on some systems by setting the window to a specified size and avoiding fullscreen
     Window.fullscreen = False  # Ensure the app runs in windowed mode

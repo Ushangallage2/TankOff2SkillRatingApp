@@ -175,3 +175,19 @@ Desktop.ini
 # Ignore output from OCR, screenshots, or other generated files
 output/
 screenshots/
+
+
+# Ignore media and build artifacts
+*.mp4
+*.avi
+*.zip
+*.rar
+*.7z
+*.tar.gz
+
+*.sqlite
+
+
+# Ignore compiled objects
+
+*.o
